@@ -1,0 +1,497 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/virtio
+
+pub const FB_WIDTH = 1280
+pub const FB_HEIGHT = 800
+pub const FB_BPP = 32
+pub const FB_PITCH = 5120 // 1280 * 4
+pub const FB_BYTES = 4096000 // 1280 * 800 * 4
+const FB_PAGES = 1000 // 4096000 / 4096
+
+const VBE_DISPI_IOPORT_INDEX = 0x01CE
+const VBE_DISPI_IOPORT_DATA = 0x01CF
+const VBE_DISPI_INDEX_ID = 0
+const VBE_DISPI_INDEX_XRES = 1
+const VBE_DISPI_INDEX_YRES = 2
+const VBE_DISPI_INDEX_BPP = 3
+const VBE_DISPI_INDEX_ENABLE = 4
+const VBE_DISPI_INDEX_VIRT_WIDTH = 6
+const VBE_DISPI_INDEX_X_OFFSET = 8
+const VBE_DISPI_INDEX_Y_OFFSET = 9
+
+@repr("C")
+pub struct FbState {
+    pub ready int
+    pub width int
+    pub height int
+    pub hw_cur_visible int
+    pub hw_cur_x int
+    pub hw_cur_y int
+    pub fb_phys u64
+    pub back_addr u64
+}
+
+static $g_fb_state FbState
+
+fn fb_state() *raw FbState {
+    unsafe {
+        << ($&g_fb_state) as *raw FbState
+    }
+}
+
+fn vbe_write(idx u16, val u16) {
+    unsafe {
+        arch.out16(u16(VBE_DISPI_IOPORT_INDEX), idx)
+        arch.out16(u16(VBE_DISPI_IOPORT_DATA), val)
+    }
+}
+
+fn vbe_read(idx u16) u16 {
+    unsafe {
+        arch.out16(u16(VBE_DISPI_IOPORT_INDEX), idx)
+        << arch.in16(u16(VBE_DISPI_IOPORT_DATA))
+    }
+}
+
+fn pci_find_bochs_vga() int {
+    $d := 0
+    while d < 32 {
+        id := virtio.pci_read32(u8(0), u8(d), u8(0), u8(0))
+        vendor := id & u32(0xFFFF)
+        device := (id >> u32(16)) & u32(0xFFFF)
+        if vendor == u32(0x1234) && device == u32(0x1111) {
+            << d
+        }
+        d += 1
+    }
+    << -1
+}
+
+pub fn fb_init() bool {
+    dev := pci_find_bochs_vga()
+    if dev < 0 {
+        << false
+    }
+    bar0 := virtio.pci_read32(u8(0), u8(dev), u8(0), u8(0x10))
+    fb_phys := u64(bar0 & u32(0xFFFFFFF0))
+    if fb_phys == u64(0) {
+        << false
+    }
+
+    // Enable PCI Memory Space access (bit 1)
+    cmd := virtio.pci_read32(u8(0), u8(dev), u8(0), u8(0x04))
+    virtio.pci_write32(u8(0), u8(dev), u8(0), u8(0x04), cmd | u32(0x02))
+
+    // Verify Bochs VBE Dispi interface is present
+    vbe_id := vbe_read(u16(VBE_DISPI_INDEX_ID))
+    if vbe_id < u16(0xB0C0) || vbe_id > u16(0xB0C5) {
+        << false
+    }
+
+    vbe_write(u16(VBE_DISPI_INDEX_ENABLE), u16(0))
+    vbe_write(u16(VBE_DISPI_INDEX_XRES), u16(FB_WIDTH))
+    vbe_write(u16(VBE_DISPI_INDEX_YRES), u16(FB_HEIGHT))
+    vbe_write(u16(VBE_DISPI_INDEX_BPP), u16(FB_BPP))
+    vbe_write(u16(VBE_DISPI_INDEX_VIRT_WIDTH), u16(FB_WIDTH))
+    vbe_write(u16(VBE_DISPI_INDEX_X_OFFSET), u16(0))
+    vbe_write(u16(VBE_DISPI_INDEX_Y_OFFSET), u16(0))
+    vbe_write(u16(VBE_DISPI_INDEX_ENABLE), u16(0x41)) // ENABLED | LFB_ENABLED
+
+    // Map 6 MiB MMIO LFB (3 x 2 MiB huge pages, supervisor-only) into kernel PML4
+    pml4 := vmm_kernel_pml4()
+    base_2m := fb_phys - (fb_phys & u64(0x1FFFFF))
+    mmio_flags := u64(VMM_PAGE_WRITABLE | VMM_PAGE_PWT) | vmm_nx_bit()
+    if !vmm_map_huge_2m(pml4, base_2m, base_2m, mmio_flags) {
+        << false
+    }
+    if !vmm_map_huge_2m(pml4, base_2m + u64(0x200000), base_2m + u64(0x200000), mmio_flags) {
+        << false
+    }
+    if !vmm_map_huge_2m(pml4, base_2m + u64(0x400000), base_2m + u64(0x400000), mmio_flags) {
+        << false
+    }
+
+    back := pmm_alloc_contiguous(FB_PAGES)
+    if back == u64(0) {
+        << false
+    }
+
+    unsafe {
+        st := fb_state()
+        *st = FbState{
+            ready: 1,
+            width: FB_WIDTH,
+            height: FB_HEIGHT,
+            hw_cur_visible: 0,
+            hw_cur_x: 0,
+            hw_cur_y: 0,
+            fb_phys: fb_phys,
+            back_addr: back
+        }
+    }
+    << true
+}
+
+pub fn fb_is_ready() bool {
+    unsafe {
+        st := fb_state()
+        << (*st).ready != 0
+    }
+}
+
+pub fn fb_put_pixel(x int, y int, color u32) {
+    if x < 0 || x >= FB_WIDTH || y < 0 || y >= FB_HEIGHT {
+        <<
+    }
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        p := ((*st).back_addr + u64((y * FB_WIDTH + x) * 4)) as *raw u32
+        *p = color
+    }
+}
+
+pub fn fb_fill_rect(x int, y int, w int, h int, color u32) {
+    if w <= 0 || h <= 0 { << }
+    $x0 := x
+    $y0 := y
+    $x1 := x + w
+    $y1 := y + h
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > FB_WIDTH { x1 = FB_WIDTH }
+    if y1 > FB_HEIGHT { y1 = FB_HEIGHT }
+    if x0 >= x1 || y0 >= y1 { << }
+
+    cw := x1 - x0
+    pair := (u64(color) << u64(32)) | u64(color)
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        base := (*st).back_addr
+        $py := y0
+        while py < y1 {
+            row_addr := base + u64((py * FB_WIDTH + x0) * 4)
+            $col := 0
+            if (row_addr & u64(7)) != u64(0) && col < cw {
+                *(row_addr as *raw u32) = color
+                col += 1
+            }
+            while col + 2 <= cw {
+                p64 := (row_addr + u64(col * 4)) as *raw u64
+                *p64 = pair
+                col += 2
+            }
+            if col < cw {
+                p32 := (row_addr + u64(col * 4)) as *raw u32
+                *p32 = color
+            }
+            py += 1
+        }
+    }
+}
+
+pub fn fb_draw_rect(x int, y int, w int, h int, color u32) {
+    if w <= 0 || h <= 0 { << }
+    fb_fill_rect(x, y, w, 1, color)
+    fb_fill_rect(x, y + h - 1, w, 1, color)
+    fb_fill_rect(x, y, 1, h, color)
+    fb_fill_rect(x + w - 1, y, 1, h, color)
+}
+
+pub fn fb_fill_gradient_v(x int, y int, w int, h int, c_top u32, c_bot u32) {
+    if w <= 0 || h <= 0 { << }
+    r0 := int((c_top >> u32(16)) & u32(0xFF))
+    g0 := int((c_top >> u32(8)) & u32(0xFF))
+    b0 := int(c_top & u32(0xFF))
+    r1 := int((c_bot >> u32(16)) & u32(0xFF))
+    g1 := int((c_bot >> u32(8)) & u32(0xFF))
+    b1 := int(c_bot & u32(0xFF))
+    $dy := 0
+    while dy < h {
+        r := r0 + ((r1 - r0) * dy) / h
+        g := g0 + ((g1 - g0) * dy) / h
+        b := b0 + ((b1 - b0) * dy) / h
+        col := u32((r << 16) | (g << 8) | b)
+        fb_fill_rect(x, y + dy, w, 1, col)
+        dy += 1
+    }
+}
+
+pub fn fb_draw_char(x int, y int, ch u8, fg u32, bg u32, transparent_bg bool) {
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        base := (*st).back_addr
+        $row := 0
+        while row < 8 {
+            py := y + row
+            if py >= 0 && py < FB_HEIGHT {
+                bits := int(font_glyph_row(ch, row))
+                $col := 0
+                while col < 8 {
+                    px := x + col
+                    if px >= 0 && px < FB_WIDTH {
+                        on := (bits & (128 >> col)) != 0
+                        if on {
+                            *((base + u64((py * FB_WIDTH + px) * 4)) as *raw u32) = fg
+                        } else if !transparent_bg {
+                            *((base + u64((py * FB_WIDTH + px) * 4)) as *raw u32) = bg
+                        }
+                    }
+                    col += 1
+                }
+            }
+            row += 1
+        }
+    }
+}
+
+pub fn fb_draw_char_2x(x int, y int, ch u8, fg u32) {
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        $row := 0
+        while row < 8 {
+            bits := int(font_glyph_row(ch, row))
+            $col := 0
+            while col < 8 {
+                if (bits & (128 >> col)) != 0 {
+                    fb_fill_rect(x + col * 2, y + row * 2, 2, 2, fg)
+                }
+                col += 1
+            }
+            row += 1
+        }
+    }
+}
+
+pub fn fb_draw_str(x int, y int, s string, fg u32) {
+    $i := 0
+    while i < s.len {
+        fb_draw_char(x + i * 8, y, u8(s[i]), fg, u32(0), true)
+        i += 1
+    }
+}
+
+pub fn fb_draw_str_ref(x int, y int, s &string, fg u32) {
+    $i := 0
+    while i < s.len {
+        fb_draw_char(x + i * 8, y, u8(s[i]), fg, u32(0), true)
+        i += 1
+    }
+}
+
+pub fn fb_draw_buf(x int, y int, buf *raw u8, len int, fg u32) {
+    $i := 0
+    while i < len {
+        unsafe {
+            ch := *(((buf as usize) + usize(i)) as *raw u8)
+            fb_draw_char(x + i * 8, y, ch, fg, u32(0), true)
+        }
+        i += 1
+    }
+}
+
+pub fn fb_draw_dec(x int, y int, val int, fg u32) int {
+    if val == 0 {
+        fb_draw_char(x, y, u8(48), fg, u32(0), true)
+        << 8
+    }
+    $cx := x
+    $n := val
+    if n < 0 {
+        fb_draw_char(cx, y, u8(45), fg, u32(0), true)
+        cx += 8
+        n = 0 - n
+    }
+    $div := 1000000000
+    $started := false
+    while div > 0 {
+        d := (n / div) % 10
+        if d != 0 || started || div == 1 {
+            started = true
+            fb_draw_char(cx, y, u8(48 + d), fg, u32(0), true)
+            cx += 8
+        }
+        div = div / 10
+    }
+    << cx - x
+}
+
+pub fn fb_draw_hex(x int, y int, val u64, fg u32) {
+    fb_draw_str(x, y, "0x", fg)
+    if val == u64(0) {
+        fb_draw_char(x + 16, y, u8(48), fg, u32(0), true)
+        <<
+    }
+    hex := "0123456789ABCDEF"
+    $cx := x + 16
+    $started := false
+    $i := 15
+    while i >= 0 {
+        nib := int((val >> u64(i * 4)) & u64(0xF))
+        if nib != 0 || started {
+            started = true
+            fb_draw_char(cx, y, u8(hex[nib]), fg, u32(0), true)
+            cx += 8
+        }
+        i -= 1
+    }
+}
+
+pub fn fb_present() {
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        (*st).hw_cur_visible = 0
+        mem.memcpy((*st).fb_phys as *raw u8, (*st).back_addr as *raw u8, FB_BYTES)
+    }
+}
+
+static hw_cur_outline [22]int = [
+    0x8000, 0xC000, 0xA000, 0x9000,
+    0x8800, 0x8400, 0x8200, 0x8100,
+    0x8080, 0x8040, 0x8020, 0x8010,
+    0x83F0, 0x8900, 0x9480, 0xA480,
+    0xC240, 0x8240, 0x0120, 0x0120,
+    0x00C0, 0x0000
+]
+
+static hw_cur_fill [22]int = [
+    0x0000, 0x0000, 0x4000, 0x6000,
+    0x7000, 0x7800, 0x7C00, 0x7E00,
+    0x7F00, 0x7F80, 0x7FC0, 0x7FE0,
+    0x7C00, 0x7600, 0x6300, 0x4300,
+    0x0180, 0x0180, 0x00C0, 0x00C0,
+    0x0000, 0x0000
+]
+
+fn fb_restore_hw_cursor(st *raw FbState) {
+    unsafe {
+        ox := (*st).hw_cur_x
+        oy := (*st).hw_cur_y
+        fb := (*st).fb_phys
+        bk := (*st).back_addr
+        $dy := 0
+        while dy < 22 {
+            py := oy + dy
+            if py >= 0 && py < FB_HEIGHT {
+                $dx := 0
+                while dx < 16 {
+                    px := ox + dx
+                    if px >= 0 && px < FB_WIDTH {
+                        off := u64((py * FB_WIDTH + px) * 4)
+                        *((fb + off) as *raw u32) = *((bk + off) as *raw u32)
+                    }
+                    dx += 1
+                }
+            }
+            dy += 1
+        }
+    }
+}
+
+fn fb_draw_hw_cursor(st *raw FbState, mx int, my int) {
+    unsafe {
+        fb := (*st).fb_phys
+        $dy := 0
+        while dy < 22 {
+            py := my + dy
+            if py >= 0 && py < FB_HEIGHT {
+                om := int(hw_cur_outline[dy])
+                fm := int(hw_cur_fill[dy])
+                $dx := 0
+                while dx < 16 {
+                    px := mx + dx
+                    if px >= 0 && px < FB_WIDTH {
+                        bit := 1 << (15 - dx)
+                        if (om & bit) != 0 {
+                            off := u64((py * FB_WIDTH + px) * 4)
+                            *((fb + off) as *raw u32) = u32(0xFFFFFFFF)
+                        } else if (fm & bit) != 0 {
+                            off := u64((py * FB_WIDTH + px) * 4)
+                            *((fb + off) as *raw u32) = u32(0xFF0F172A)
+                        }
+                    }
+                    dx += 1
+                }
+            }
+            dy += 1
+        }
+    }
+}
+
+pub fn fb_sync_hw_cursor(mx int, my int) {
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 { << }
+        if (*st).hw_cur_visible != 0 && (*st).hw_cur_x == mx && (*st).hw_cur_y == my {
+            <<
+        }
+        if (*st).hw_cur_visible != 0 {
+            fb_restore_hw_cursor(st)
+        }
+        fb_draw_hw_cursor(st, mx, my)
+        (*st).hw_cur_visible = 1
+        (*st).hw_cur_x = mx
+        (*st).hw_cur_y = my
+    }
+}
+
+pub fn fb_present_raw(src *raw u8, nbytes int) bool {
+    if src == 0 as *raw u8 || nbytes <= 0 || nbytes > FB_BYTES {
+        << false
+    }
+    unsafe {
+        st := fb_state()
+        if (*st).ready == 0 {
+            << false
+        }
+        bk := usize((*st).back_addr)
+        fb := usize((*st).fb_phys)
+        sa := src as usize
+        qwords := nbytes / 8
+
+        // Erase current cursor from back_addr -> fb_phys before diff-copying unchanged areas
+        if (*st).hw_cur_visible != 0 {
+            fb_restore_hw_cursor(st)
+            (*st).hw_cur_visible = 0
+        }
+
+        // Keep interrupts enabled while diff-copying so PS/2/vmmouse IRQ12 packets never drop
+        arch.sti()
+        $qi := 0
+        while qi < qwords {
+            off := usize(qi * 8)
+            v := *((sa + off) as *raw u64)
+            bp := (bk + off) as *raw u64
+            if *bp != v {
+                *bp = v
+                *((fb + off) as *raw u64) = v
+            }
+            qi += 1
+        }
+        rem_start := qwords * 8
+        $bi := rem_start
+        while bi < nbytes {
+            off := usize(bi)
+            vb := *((sa + off) as *raw u8)
+            bb := (bk + off) as *raw u8
+            if *bb != vb {
+                *bb = vb
+                *((fb + off) as *raw u8) = vb
+            }
+            bi += 1
+        }
+        arch.cli()
+
+        (*st).hw_cur_visible = 0
+        fb_sync_hw_cursor(mouse_get_x(), mouse_get_y())
+    }
+    << true
+}

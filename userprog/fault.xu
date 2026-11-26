@@ -1,0 +1,31 @@
+@main
+$freestanding
+
+#core/arch
+
+const SYS_WRITE = 1
+const SYS_EXIT = 60
+
+static fault_msg [59]u8 = "[RING3-FAULT] Triggering intentional #PF on kernel addr...\n"
+
+@export("_start")
+@noreturn
+pub fn user_start() {
+    unsafe {
+        msg_ptr := ((&fault_msg[0]) as *raw u8) as u64
+        arch.syscall3(u64(SYS_WRITE), u64(1), msg_ptr, u64(59))
+
+        // Deliberate Ring 3 access to supervisor-only kernel page (0x00100000) -> #PF (vec 14)
+        kptr := u64(0x00100000) as *raw u64
+        _v := *kptr
+    }
+
+    arch.syscall1(u64(SYS_EXIT), u64(99))
+    while true {
+        arch.pause()
+    }
+}
+
+fn main() int {
+    << 0
+}

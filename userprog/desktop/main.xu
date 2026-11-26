@@ -1,0 +1,1137 @@
+@main
+
+#os
+#strconv
+#strings
+#time
+#ui
+#ui/chart
+#ui/draw
+#ui/font
+#ui/widgets
+
+fn parse_stat_field(stat &string, key string) int {
+    pat := key + "="
+    plen := pat.len
+    idx := strings.index_of(stat, pat)
+    if idx < 0 { << 0 }
+    start := idx + plen
+    $end := start
+    while end < stat.len {
+        c := stat[end] & 255
+        if c < 48 || c > 57 { <- }
+        end += 1
+    }
+    if end <= start { << 0 }
+    tok := stat[start:end]
+    res := strconv.atoi(&tok) or (err) { << 0 }
+    << res
+}
+
+fn read_input_i32(buf &string, off int) int {
+    $v := (buf[off] & 255) |
+          ((buf[off + 1] & 255) << 8) |
+          ((buf[off + 2] & 255) << 16) |
+          ((buf[off + 3] & 255) << 24)
+    if (v & 0x80000000) != 0 {
+        v = v - 0x100000000
+    }
+    << v
+}
+
+fn write_cmd(cmd string) {
+    _ := os.write("/dev/cmd", cmd) or (err) { << }
+}
+
+fn try_read(path string, fallback string) string {
+    << os.read(path) or (err) { << fallback }
+}
+
+fn try_fd_read(f &os.File, max int) string {
+    << f.read(max) or (err) { << "" }
+}
+
+fn try_write_fb(f &os.File, pixels &string) {
+    _ := f.write(*pixels) or (err) { << }
+}
+
+fn try_close(f $&os.File) {
+    _ := f.close() or (err) { << }
+}
+
+fn try_handle_input(s $&widgets.Screen, ev &ui.InputEvent) []widgets.Action {
+    << s.handle_input(ev) or (err) { << []widgets.Action{} }
+}
+
+fn try_advance(s $&widgets.Screen) {
+    _ := s.advance(time.instant()) or (err) { << }
+}
+
+fn try_export_xdf(s $&widgets.Screen) string {
+    << s.export_xdf() or (err) { << "" }
+}
+
+fn try_set_text(s $&widgets.Screen, id int, txt string) {
+    _ := s.set_text(id, txt) or (err) { << }
+}
+
+fn try_set_num(s $&widgets.Screen, id int, v f64) {
+    _ := s.set_number_value(id, v) or (err) { << }
+}
+
+fn try_set_styles(s $&widgets.Screen, st &widgets.Styles) {
+    _ := s.set_styles(st) or (err) { << }
+}
+
+fn try_selected(s $&widgets.Screen, id int) int {
+    << s.selected(id) or (err) { << 0 }
+}
+
+fn try_toggle(s $&widgets.Screen, id int) bool {
+    << s.toggle_value(id) or (err) { << true }
+}
+
+fn try_number(s $&widgets.Screen, id int, fallback f64) f64 {
+    << s.number_value(id) or (err) { << fallback }
+}
+
+fn try_set_chart_series(s $&widgets.Screen, id int, ser &[]chart.ChartSeries) {
+    _ := s.set_chart_series(id, ser) or (err) { << }
+}
+
+fn try_show_toast(s $&widgets.Screen, id int, msg string, dur time.Duration) {
+    _ := s.show_toast(id, msg, dur) or (err) { << }
+}
+
+fn try_load_ttf(fstack $&font.FontStack, path string) {
+    ttf_raw := try_read(path, "")
+    if ttf_raw.len <= 1000 { << }
+    ttf_bytes := font.bytes_from_string(&ttf_raw)
+    ttf_face := font.parse_ttf(&ttf_bytes, 0, 1) or (err) {
+        println("[UI-DESKTOP] ttf parse err: " + err.msg())
+        <<
+    }
+    _ := fstack.add_face(ttf_face)
+}
+
+fn build_telemetry_series(ticks int, free_fr int, tot_fr int) []chart.ChartSeries {
+    $s := widgets.chart_series(1, "Free RAM %", widgets.CHART_AREA)
+    $pts := []chart.ChartPoint{}
+    $base_pct := 85.0
+    if tot_fr > 0 {
+        base_pct = f64(free_fr * 100) / f64(tot_fr)
+    }
+    for i in 0:10 {
+        wave := f64(((ticks / 10 + i * 3) % 7) - 3) * 0.4
+        $val := base_pct + wave
+        if val < 5.0 { val = 5.0 }
+        if val > 99.0 { val = 99.0 }
+        pts.push(widgets.chart_point(i + 1, f64(i + 1), val))
+    }
+    s.points = pts
+    << [s]
+}
+
+fn safe_atoi(s &string) int {
+    << strconv.atoi(s) or (err) { << 0 }
+}
+
+fn format_bytes(sz int) string {
+    if sz >= 1048576 {
+        tenths := (sz * 10 + 524288) / 1048576
+        << str(tenths / 10) + "." + str(tenths % 10) + " MiB"
+    }
+    if sz >= 1024 {
+        << str((sz + 512) / 1024) + " KiB"
+    }
+    << str(sz) + " B"
+}
+
+fn load_xufs_lines() []string {
+    raw := try_read("/proc/files", "")
+    $lines := []string{}
+    if raw.len == 0 {
+        lines.push("(empty)")
+        << lines
+    }
+    parts := strings.split(&raw, "\n")
+    for p in parts {
+        if p.len > 0 {
+            tab_idx := strings.index_of(&p, "\t")
+            if tab_idx >= 0 {
+                fpath := p[0:tab_idx]
+                fsize_s := p[tab_idx + 1 : p.len]
+                sz := safe_atoi(&fsize_s)
+                lines.push(fpath + "   —   " + format_bytes(sz))
+            } else {
+                lines.push(p)
+            }
+        }
+    }
+    if lines.len == 0 { lines.push("(empty)") }
+    << lines
+}
+
+fn load_xufs_paths() []string {
+    raw := try_read("/proc/files", "")
+    $paths := []string{}
+    if raw.len == 0 {
+        paths.push("")
+        << paths
+    }
+    parts := strings.split(&raw, "\n")
+    for p in parts {
+        if p.len > 0 {
+            tab_idx := strings.index_of(&p, "\t")
+            if tab_idx >= 0 {
+                paths.push(p[0:tab_idx])
+            } else {
+                paths.push(p)
+            }
+        }
+    }
+    if paths.len == 0 { paths.push("") }
+    << paths
+}
+
+fn show_app_output(s $&widgets.Screen, lbl1 int, lbl2 int, lbl3 int, raw_out &string) {
+    $lines := []string{}
+    parts := strings.split(raw_out, "\n")
+    for p in parts {
+        tr := strings.trim_space(&p)
+        if tr.len > 0 { lines.push(tr) }
+    }
+    if lines.len > 0 { try_set_text(s, lbl1, lines[0]) } else { try_set_text(s, lbl1, "(no output)") }
+    if lines.len > 1 { try_set_text(s, lbl2, lines[1]) } else { try_set_text(s, lbl2, "") }
+    if lines.len > 2 { try_set_text(s, lbl3, lines[2]) } else { try_set_text(s, lbl3, "") }
+}
+
+fn set_tab_visibility(s $&widgets.Screen, tab int,
+                      t0_ids &[]int, t1_ids &[]int, t2_ids &[]int) {
+    for id in t0_ids { s.set_visible(id, tab == 0) or (err) { -> } }
+    for id in t1_ids { s.set_visible(id, tab == 1) or (err) { -> } }
+    for id in t2_ids { s.set_visible(id, tab == 2) or (err) { -> } }
+}
+
+fn make_ptr_ev(kind int, x f64, y f64, btn int, btns int, clicks int) ui.InputEvent {
+    << ui.InputEvent{
+        kind: kind,
+        window_id: 1,
+        canvas_id: 1,
+        generation: 1,
+        x: x,
+        y: y,
+        dx: 0.0,
+        dy: 0.0,
+        button: btn,
+        buttons: btns,
+        modifiers: 0,
+        key: 0,
+        scan: 0,
+        repeat: 0,
+        click_count: clicks,
+        time_ns: 0
+    }
+}
+
+fn main() int {
+    is_macos := xu_target_os() == 0
+    $abi_name := "linux"
+    $abi_badge_txt := "Linux ELF64"
+    $swap_btn_txt := "Switch macOS"
+    if is_macos {
+        abi_name = "macos"
+        abi_badge_txt = "macOS Mach-O"
+        swap_btn_txt = "Switch Linux"
+    }
+
+    mode_str := try_read("/proc/mode", "interactive\n")
+    is_smoke := strings.contains(&mode_str, "smoke")
+
+    $raster := sw_raster_new(SW_WIDTH, SW_HEIGHT)
+    $fstack := font.new_font_stack()
+    try_load_ttf($&fstack, "/etc/font.ttf")
+    fstack.ensure_builtin_fallback(2) or (err) { << 1 }
+    $fatlas := font.new_glyph_atlas(1024, 1024, 2048, 2048) or (err) { << 1 }
+
+    $s := widgets.hostless_screen(f64(SW_WIDTH), f64(SW_HEIGHT)) or (err) {
+        println("[UI-DESKTOP] screen init err: " + err.msg())
+        << 2
+    }
+    dark_st := widgets.dark_styles()
+    s.set_styles(&dark_st) or (err) { << 3 }
+
+    // Header strip (1280x800 widescreen)
+    hdr_card := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(hdr_card, 14.0, 10.0, 1252.0, 52.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    title_lbl := s.label("Xu OS Desktop  (#ui/widgets Ring 3)", 16.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(title_lbl, 26.0, 21.0, 364.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    abi_badge := s.badge(abi_badge_txt + "") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(abi_badge, 402.0, 21.0, 186.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    theme_sw := s.switch_control("Dark", true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(theme_sw, 606.0, 19.0, 116.0, 32.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    swap_btn := s.button(swap_btn_txt) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(swap_btn, 740.0, 17.0, 168.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    shell_btn := s.button("Exit Shell") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(shell_btn, 922.0, 17.0, 158.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    power_btn := s.button("Poweroff") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(power_btn, 1094.0, 17.0, 158.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    // Main Tabs
+    tabs_id := s.tabs(&["System Overview", "XuFS Explorer", "Widget Showcase"], 0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(tabs_id, 14.0, 72.0, 1252.0, 40.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    // === Tab 0: System Overview ===
+    ov_left := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ov_left, 14.0, 124.0, 618.0, 336.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    ov_title := s.label("Kernel Subsystems (Live /proc/stat)", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ov_title, 30.0, 138.0, 586.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_ticks := s.label("PIT 100Hz Ticks: 0   Tasks: 0   Demand #PF: 0", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_ticks, 30.0, 174.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_mem := s.label("Physical RAM Free:", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_mem, 30.0, 210.0, 586.0, 22.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    prog_mem := s.progress(0.85) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(prog_mem, 30.0, 236.0, 586.0, 16.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_heap := s.label("Kernel Heap Used:", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_heap, 30.0, 268.0, 586.0, 22.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    prog_heap := s.progress(0.10) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(prog_heap, 30.0, 294.0, 586.0, 16.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_status := s.label("Ready — Dual-ABI ELF64 & Mach-O active.", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_status, 30.0, 330.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_spawn := s.button("Spawn Kernel Worker") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_spawn, 30.0, 386.0, 280.0, 44.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_persist := s.button("Save /tmp/ui_note.txt") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_persist, 336.0, 386.0, 280.0, 44.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    ov_right := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ov_right, 648.0, 124.0, 618.0, 336.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    ch_lbl := s.label("Live Memory & Tick Chart (#ui/chart)", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ch_lbl, 664.0, 138.0, 586.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    chart_id := s.chart() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(chart_id, 664.0, 172.0, 586.0, 272.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    ov_bot := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ov_bot, 14.0, 476.0, 618.0, 308.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    motd_txt := try_read("/etc/motd", "Welcome to Xu OS!")
+    lbl_arch1 := s.label("Dual-ABI Runtime & UI Pipeline", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch1, 30.0, 492.0, 586.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_arch2 := s.label("Pipeline: Screen.export_xdf() -> 4xAA XDF1 -> /dev/fb0", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch2, 30.0, 532.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_arch3 := s.label("Guests: Unmodified Linux ELF64 + macOS x86_64 Mach-O", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch3, 30.0, 568.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_arch4 := s.label("Typography: TrueType Lato (/etc/font.ttf) + GlyphAtlas", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch4, 30.0, 604.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_arch5 := s.label("Isolation: Per-Process CR3, W^X+NX & #PF Demand Paging", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch5, 30.0, 640.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_arch6 := s.label("Pointer: QEMU vmmouse 1:1 Absolute + PS/2 IRQ1/IRQ12", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_arch6, 30.0, 676.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    ov_right2 := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(ov_right2, 648.0, 476.0, 618.0, 308.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_snap_hdr := s.label("Environment & XuFS Storage", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_snap_hdr, 664.0, 492.0, 586.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_motd := s.label("MOTD (/etc/motd): " + strings.trim_space(&motd_txt), 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_motd, 664.0, 532.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    $fs_lines := load_xufs_lines()
+    lbl_files_cnt := s.label("Mounted Files: " + str(fs_lines.len) + " inodes on VirtIO-Blk (16 MiB)", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_files_cnt, 664.0, 568.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_bins := s.label("Binaries: /bin/desktop_linux + /bin/desktop_macos", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_bins, 664.0, 604.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_tip1 := s.label("Tip: Click Switch macOS / Switch Linux to hot-swap ABI", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_tip1, 664.0, 640.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_tip2 := s.label("Tip: Press Esc or Exit Shell to return to Xu OS console", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_tip2, 664.0, 676.0, 586.0, 24.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    // === Tab 1: XuFS Explorer ===
+    fs_left := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(fs_left, 14.0, 124.0, 680.0, 660.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    fs_hdr := s.label("Persistent XuFS Inodes (VirtIO-Blk)", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(fs_hdr, 30.0, 138.0, 640.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    fs_list := s.list_box(&fs_lines, 0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(fs_list, 30.0, 176.0, 648.0, 530.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_fs_note := s.button("Persist Note to XuFS") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_fs_note, 30.0, 722.0, 260.0, 44.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    fs_right := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(fs_right, 710.0, 124.0, 556.0, 660.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    fs_det_hdr := s.label("Selected File Info", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(fs_det_hdr, 726.0, 138.0, 524.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_fs_sel := s.label(fs_lines[0], 14.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_fs_sel, 726.0, 182.0, 524.0, 34.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_fs_motd := s.label("Content (/etc/motd): " + strings.trim_space(&motd_txt), 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_fs_motd, 726.0, 224.0, 524.0, 44.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    fs_paths := load_xufs_paths()
+    btn_fs_run := s.button("Launch / Run Selected") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_fs_run, 726.0, 286.0, 252.0, 42.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_run_lnx := s.button("Run Linux App (ELF64)") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_run_lnx, 726.0, 342.0, 252.0, 40.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_run_mac := s.button("Run macOS App (Mach-O)") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_run_mac, 994.0, 342.0, 252.0, 40.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_out_hdr := s.label("Subprocess Output (/proc/app_out)", 14.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_out_hdr, 726.0, 404.0, 524.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_out_1 := s.label("Click Run Linux App / Run macOS App or select a binary.", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_out_1, 726.0, 440.0, 524.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_out_2 := s.label("", 13.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_out_2, 726.0, 472.0, 524.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_out_3 := s.label("", 13.0, true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_out_3, 726.0, 504.0, 524.0, 26.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    // === Tab 2: Widget Showcase ===
+    wg_left := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(wg_left, 14.0, 124.0, 618.0, 660.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    wg_hdr1 := s.label("Toggle & Choice Controls", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(wg_hdr1, 30.0, 138.0, 586.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    chk_a := s.checkbox("Strict W^X + NX Segment Isolation", true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(chk_a, 30.0, 182.0, 560.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    chk_b := s.checkbox("Hardware Demand Paging (#PF mmap)", true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(chk_b, 30.0, 228.0, 560.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    sw_demo := s.switch_control("Darwin + Linux Dual-ABI Syscalls", true) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(sw_demo, 30.0, 278.0, 560.0, 38.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    rad_grp := s.radio_group(&["Standard Theme Density", "Compact Inspector", "Presentation Mode"], 0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(rad_grp, 30.0, 336.0, 560.0, 138.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    wg_right := s.card() or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(wg_right, 648.0, 124.0, 618.0, 660.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    wg_hdr2 := s.label("Sliders, Steppers & Notifications", 15.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(wg_hdr2, 664.0, 138.0, 586.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    lbl_slider := s.label("Interactive Value: 65%", 14.0, false) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(lbl_slider, 664.0, 182.0, 586.0, 28.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    sld_demo := s.slider(0.0, 100.0, 65.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(sld_demo, 664.0, 222.0, 560.0, 36.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    stp_demo := s.stepper(0.0, 100.0, 5.0, 65.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(stp_demo, 664.0, 276.0, 200.0, 40.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    prog_demo := s.progress(0.65) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(prog_demo, 664.0, 338.0, 560.0, 18.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    btn_toast := s.button("Trigger #ui/widgets Toast") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+    s.place(btn_toast, 664.0, 386.0, 260.0, 44.0) or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    toast_id := s.toast("Real #ui/widgets running in Ring 3!") or (err) {
+        println("[UI-DESKTOP] widget err: " + err.msg())
+        << 4
+    }
+
+    t0_ids := [ov_left, ov_title, lbl_ticks, lbl_mem, prog_mem, lbl_heap, prog_heap,
+               lbl_status, btn_spawn, btn_persist, ov_right, ch_lbl, chart_id,
+               ov_bot, lbl_arch1, lbl_arch2, lbl_arch3, lbl_arch4, lbl_arch5, lbl_arch6,
+               ov_right2, lbl_snap_hdr, lbl_motd, lbl_files_cnt, lbl_bins, lbl_tip1, lbl_tip2]
+    t1_ids := [fs_left, fs_hdr, fs_list, btn_fs_note, fs_right, fs_det_hdr, lbl_fs_sel, lbl_fs_motd,
+               btn_fs_run, btn_run_lnx, btn_run_mac, lbl_out_hdr, lbl_out_1, lbl_out_2, lbl_out_3]
+    t2_ids := [wg_left, wg_hdr1, chk_a, chk_b, sw_demo, rad_grp,
+               wg_right, wg_hdr2, lbl_slider, sld_demo, stp_demo, prog_demo, btn_toast]
+
+    set_tab_visibility($&s, 0, &t0_ids, &t1_ids, &t2_ids)
+
+    // Populate initial /proc/stat & chart
+    $last_stat_ticks := -1000
+    stat0 := try_read("/proc/stat", "")
+    t_init := parse_stat_field(&stat0, "ticks")
+    free_init := parse_stat_field(&stat0, "free_frames")
+    tot_init := parse_stat_field(&stat0, "total_frames")
+    hused_init := parse_stat_field(&stat0, "heap_used")
+    hsize_init := parse_stat_field(&stat0, "heap_size")
+    tasks_init := parse_stat_field(&stat0, "tasks")
+    dpf_init := parse_stat_field(&stat0, "demand_pfs")
+    try_set_text($&s, lbl_ticks, "PIT 100Hz Ticks: " + str(t_init) + "   Tasks: " + str(tasks_init) + "   Demand #PF: " + str(dpf_init))
+    if tot_init > 0 {
+        try_set_text($&s, lbl_mem, "Physical RAM Free: " + str(free_init * 4 / 1024) + " MiB / " + str(tot_init * 4 / 1024) + " MiB")
+        try_set_num($&s, prog_mem, f64(free_init) / f64(tot_init))
+    }
+    if hsize_init > 0 {
+        try_set_text($&s, lbl_heap, "Kernel Heap Used: " + str(hused_init) + " B / " + str(hsize_init) + " B")
+        try_set_num($&s, prog_heap, f64(hused_init) / f64(hsize_init))
+    }
+    series0 := build_telemetry_series(t_init, free_init, tot_init)
+    try_set_chart_series($&s, chart_id, &series0)
+
+    $fb_file := os.create("/dev/fb0") or (err) {
+        println("[UI-DESKTOP] failed to open /dev/fb0: " + err.msg())
+        << 5
+    }
+
+    if is_smoke {
+        xdf1 := s.export_xdf() or (err) {
+            println("[UI-DESKTOP] export_xdf err: " + err.msg())
+            << 6
+        }
+        raster.render_xdf(&xdf1, &fstack, $&fatlas)
+        raster.draw_cursor(660, 35)
+        try_write_fb(&fb_file, &raster.pixels)
+        h1 := raster.pixel_sample_hash()
+
+        // Click the Dark/Light Theme switch via real #ui/widgets input dispatch
+        ev_mv := make_ptr_ev(ui.EV_POINTER_MOVE, 660.0, 35.0, 0, 0, 0)
+        ev_dn := make_ptr_ev(ui.EV_POINTER_DOWN, 660.0, 35.0, ui.BUTTON_LEFT, 1, 1)
+        ev_up := make_ptr_ev(ui.EV_POINTER_UP, 660.0, 35.0, ui.BUTTON_LEFT, 0, 1)
+        _ := try_handle_input($&s, &ev_mv)
+        _ := try_handle_input($&s, &ev_dn)
+        acts := try_handle_input($&s, &ev_up)
+        for a in acts {
+            if a.id == theme_sw && a.kind == widgets.ACTION_CHANGE {
+                lst := widgets.light_styles()
+                try_set_styles($&s, &lst)
+            }
+        }
+        xdf2 := s.export_xdf() or (err) { << 7 }
+        raster.render_xdf(&xdf2, &fstack, $&fatlas)
+        raster.draw_cursor(660, 35)
+        try_write_fb(&fb_file, &raster.pixels)
+        h2 := raster.pixel_sample_hash()
+
+        if xdf1.len < 200 || h1 == 0 || h1 == h2 {
+            println("[UI-DESKTOP] smoke validation failed xdf1=" + str(xdf1.len) + " h1=" + str(h1) + " h2=" + str(h2))
+            << 8
+        }
+        println("[UI-DESKTOP] ABI=" + abi_name + " xdf_bytes=" + str(xdf1.len) + " h1=" + str(h1) + " h2=" + str(h2) + " OK")
+        try_close($&fb_file)
+        << 0
+    }
+
+    // Interactive event loop
+    $in_file := os.open("/dev/input") or (err) {
+        println("[UI-DESKTOP] failed to open /dev/input: " + err.msg())
+        << 9
+    }
+
+    $mx := 512
+    $my := 384
+    $btns := 0
+    $cur_tab := 0
+    $sel_fs_idx := 0
+    $frame_seq := 0
+    $need_present := true
+
+    while true {
+        $ev_batch := try_fd_read(&in_file, 512)
+        $pending_actions := []widgets.Action{}
+        $eoff := 0
+        while eoff + 16 <= ev_batch.len {
+            ekind := read_input_i32(&ev_batch, eoff)
+            ex := read_input_i32(&ev_batch, eoff + 4)
+            ey := read_input_i32(&ev_batch, eoff + 8)
+            eval := read_input_i32(&ev_batch, eoff + 12)
+            eoff += 16
+
+            if ekind == 1 {
+                mx = ex
+                my = ey
+                btns = eval
+                ev := make_ptr_ev(ui.EV_POINTER_MOVE, f64(mx), f64(my), 0, btns, 0)
+                acts := try_handle_input($&s, &ev)
+                for a in acts { pending_actions.push(a) }
+            } else if ekind == 2 {
+                mx = ex
+                my = ey
+                btns = eval
+                ev := make_ptr_ev(ui.EV_POINTER_DOWN, f64(mx), f64(my), ui.BUTTON_LEFT, btns, 1)
+                acts := try_handle_input($&s, &ev)
+                for a in acts { pending_actions.push(a) }
+                need_present = true
+            } else if ekind == 3 {
+                mx = ex
+                my = ey
+                btns = eval
+                ev := make_ptr_ev(ui.EV_POINTER_UP, f64(mx), f64(my), ui.BUTTON_LEFT, btns, 1)
+                acts := try_handle_input($&s, &ev)
+                for a in acts { pending_actions.push(a) }
+                need_present = true
+            } else if ekind == 6 {
+                if eval == 27 {
+                    try_close($&in_file)
+                    try_close($&fb_file)
+                    << 0
+                }
+                ev := ui.InputEvent{
+                    kind: ui.EV_KEY_DOWN, window_id: 1, canvas_id: 1, generation: 1,
+                    x: f64(mx), y: f64(my), dx: 0.0, dy: 0.0,
+                    button: 0, buttons: btns, modifiers: 0,
+                    key: eval, scan: 0, repeat: 0, click_count: 0, time_ns: 0
+                }
+                acts := try_handle_input($&s, &ev)
+                for a in acts { pending_actions.push(a) }
+                need_present = true
+            }
+        }
+
+        try_advance($&s)
+        timed := s.take_actions()
+        for a in timed { pending_actions.push(a) }
+
+        for a in pending_actions {
+            if a.id == tabs_id && a.kind == widgets.ACTION_CHANGE {
+                ntab := try_selected($&s, tabs_id)
+                if ntab != cur_tab {
+                    cur_tab = ntab
+                    set_tab_visibility($&s, cur_tab, &t0_ids, &t1_ids, &t2_ids)
+                    if cur_tab == 0 {
+                        last_stat_ticks = -1000
+                    }
+                }
+            } else if a.id == theme_sw && a.kind == widgets.ACTION_CHANGE {
+                is_dark := try_toggle($&s, theme_sw)
+                if is_dark {
+                    dst := widgets.dark_styles()
+                    try_set_styles($&s, &dst)
+                } else {
+                    lst := widgets.light_styles()
+                    try_set_styles($&s, &lst)
+                }
+            } else if a.id == swap_btn && a.kind == widgets.ACTION_ACTIVATE {
+                try_close($&in_file)
+                try_close($&fb_file)
+                if is_macos { << 71 }
+                << 72
+            } else if a.id == shell_btn && a.kind == widgets.ACTION_ACTIVATE {
+                try_close($&in_file)
+                try_close($&fb_file)
+                << 0
+            } else if a.id == power_btn && a.kind == widgets.ACTION_ACTIVATE {
+                write_cmd("poweroff")
+            } else if a.id == btn_spawn && a.kind == widgets.ACTION_ACTIVATE {
+                write_cmd("spawn")
+                try_set_text($&s, lbl_status, "Spawned dyn_worker kernel task!")
+                last_stat_ticks = -1000
+            } else if (a.id == btn_persist || a.id == btn_fs_note) && a.kind == widgets.ACTION_ACTIVATE {
+                write_cmd("persist")
+                try_set_text($&s, lbl_status, "Persisted /tmp/ui_note.txt to XuFS!")
+                try_set_text($&s, lbl_fs_sel, "Saved /tmp/ui_note.txt -> reboot-safe XuFS")
+            } else if a.id == fs_list && a.kind == widgets.ACTION_CHANGE {
+                sel := try_selected($&s, fs_list)
+                if sel >= 0 && sel < fs_lines.len {
+                    sel_fs_idx = sel
+                    try_set_text($&s, lbl_fs_sel, "Inode: " + fs_lines[sel])
+                }
+            } else if a.id == btn_fs_run && a.kind == widgets.ACTION_ACTIVATE {
+                $sel_p := ""
+                if sel_fs_idx >= 0 && sel_fs_idx < fs_paths.len {
+                    sel_p = fs_paths[sel_fs_idx]
+                }
+                if sel_p == "/bin/desktop_linux" {
+                    try_close($&in_file)
+                    try_close($&fb_file)
+                    << 71
+                } else if sel_p == "/bin/desktop_macos" {
+                    try_close($&in_file)
+                    try_close($&fb_file)
+                    << 72
+                } else if sel_p == "/bin/linux_app" {
+                    write_cmd("run_linux")
+                    out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                    show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+                } else if sel_p == "/bin/macos_app" {
+                    write_cmd("run_macos")
+                    out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                    show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+                } else if sel_p == "/bin/hello.elf" {
+                    write_cmd("run_hello")
+                    out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                    show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+                } else if sel_p == "/bin/fault.elf" {
+                    write_cmd("run_fault")
+                    out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                    show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+                } else if sel_p == "/etc/motd" {
+                    m := try_read("/etc/motd", "")
+                    show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &m)
+                } else {
+                    try_set_text($&s, lbl_out_1, "Selected asset: " + sel_p)
+                    try_set_text($&s, lbl_out_2, "Not directly executable; pick /bin/*")
+                    try_set_text($&s, lbl_out_3, "")
+                }
+            } else if a.id == btn_run_lnx && a.kind == widgets.ACTION_ACTIVATE {
+                write_cmd("run_linux")
+                out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+            } else if a.id == btn_run_mac && a.kind == widgets.ACTION_ACTIVATE {
+                write_cmd("run_macos")
+                out_s := try_read("/proc/app_out", "exit=-1\n(no output)")
+                show_app_output($&s, lbl_out_1, lbl_out_2, lbl_out_3, &out_s)
+            } else if a.id == sld_demo && (a.kind == widgets.ACTION_CHANGE || a.kind == widgets.ACTION_COMMIT) {
+                v := try_number($&s, sld_demo, 50.0)
+                try_set_num($&s, stp_demo, v)
+                try_set_num($&s, prog_demo, v / 100.0)
+                try_set_text($&s, lbl_slider, "Interactive Value: " + str(int(v)) + "%")
+            } else if a.id == stp_demo && a.kind == widgets.ACTION_CHANGE {
+                v := try_number($&s, stp_demo, 50.0)
+                try_set_num($&s, sld_demo, v)
+                try_set_num($&s, prog_demo, v / 100.0)
+                try_set_text($&s, lbl_slider, "Interactive Value: " + str(int(v)) + "%")
+            } else if a.id == btn_toast && a.kind == widgets.ACTION_ACTIVATE {
+                try_show_toast($&s, toast_id, "#ui/widgets running on " + abi_badge_txt + "!", time.duration(3 * time.second()))
+            }
+        }
+
+        // Periodic telemetry refresh every ~100 ticks (1.0s) when System Overview tab is active
+        frame_seq += 1
+        if cur_tab == 0 && frame_seq % 40 == 0 {
+            st_now := try_read("/proc/stat", "")
+            t_now := parse_stat_field(&st_now, "ticks")
+            if t_now - last_stat_ticks >= 100 || t_now < last_stat_ticks {
+                last_stat_ticks = t_now
+                free_n := parse_stat_field(&st_now, "free_frames")
+                tot_n := parse_stat_field(&st_now, "total_frames")
+                hu_n := parse_stat_field(&st_now, "heap_used")
+                hs_n := parse_stat_field(&st_now, "heap_size")
+                tk_n := parse_stat_field(&st_now, "tasks")
+                pf_n := parse_stat_field(&st_now, "demand_pfs")
+                try_set_text($&s, lbl_ticks, "PIT 100Hz Ticks: " + str(t_now) + "   Tasks: " + str(tk_n) + "   Demand #PF: " + str(pf_n))
+                if tot_n > 0 {
+                    try_set_text($&s, lbl_mem, "Physical RAM Free: " + str(free_n * 4 / 1024) + " MiB / " + str(tot_n * 4 / 1024) + " MiB")
+                    try_set_num($&s, prog_mem, f64(free_n) / f64(tot_n))
+                }
+                if hs_n > 0 {
+                    try_set_text($&s, lbl_heap, "Kernel Heap Used: " + str(hu_n) + " B / " + str(hs_n) + " B")
+                    try_set_num($&s, prog_heap, f64(hu_n) / f64(hs_n))
+                }
+                ser_now := build_telemetry_series(t_now, free_n, tot_n)
+                try_set_chart_series($&s, chart_id, &ser_now)
+            }
+        }
+
+        if s.is_dirty() {
+            xdf := try_export_xdf($&s)
+            if xdf.len > 0 {
+                raster.render_xdf(&xdf, &fstack, $&fatlas)
+                need_present = true
+            }
+        }
+        if need_present {
+            try_write_fb(&fb_file, &raster.pixels)
+            need_present = false
+        }
+
+        if ev_batch.len == 0 && !s.is_dirty() {
+            time.sleep(10 * time.millisecond())
+        }
+    }
+
+    << 0
+}

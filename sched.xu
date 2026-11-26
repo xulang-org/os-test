@@ -1,0 +1,459 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/sync
+#core/task
+
+const TCB_STRIDE = sizeof(TaskControlBlock)
+const MAX_TASKS = 16
+const TASK_STACK_PAGES = 4
+const TASK_STACK_BYTES = 16384
+const DEFAULT_QUANTUM = 5
+
+@repr("C")
+pub struct SchedState {
+    pub enabled int
+    pub current_tid int
+    pub task_count int
+    pub next_tid int
+    pub quantum_rem int
+    pub quantum_len int
+    pub total_switches u64
+    pub need_resched int
+    pub lock sync.IrqSpinlock
+}
+
+@repr("C")
+pub struct TaskControlBlock {
+    pub tid int
+    pub state int
+    pub saved_rsp u64
+    pub stack_base u64
+    pub stack_size u64
+    pub ticks u64
+    pub switches u64
+    pub wake_tick u64
+    pub name_len int
+    pub name_w0 u64
+    pub name_w1 u64
+    pub pad0 u64
+    pub pad1 u64
+    pub pad2 u64
+    pub pad3 u64
+    pub pad4 u64
+}
+
+@repr("C")
+pub struct DemoState {
+    pub worker_a_iters u64
+    pub worker_b_iters u64
+    pub worker_b_heap_ops u64
+    pub dyn_worker_iters u64
+    pub coop_step int
+    pub shared_counter u64
+    pub shared_lock sync.IrqSpinlock
+}
+
+static_assert(sizeof(TaskControlBlock) == 128 && offsetof(TaskControlBlock, name_w0) == 72, "TCB layout mismatch")
+static_assert(sizeof(task.TaskContext) == 192 && alignof(task.TaskContext) == 16, "TaskContext layout mismatch")
+
+static $g_sched_state SchedState
+
+@align(64)
+static $tcb_table [MAX_TASKS]TaskControlBlock
+
+static $g_demo_state DemoState
+
+@align(16)
+static $coop_ctxs [2]task.TaskContext
+
+@align(16)
+static $coop_stack [PAGE_SIZE]u8
+
+pub fn sched_state() *raw SchedState {
+    unsafe {
+        << ($&g_sched_state) as *raw SchedState
+    }
+}
+
+pub fn demo_state() *raw DemoState {
+    unsafe {
+        << ($&g_demo_state) as *raw DemoState
+    }
+}
+
+pub fn tcb_at(tid int) *raw TaskControlBlock {
+    unsafe {
+        base := (($&tcb_table[0]) as *raw TaskControlBlock) as usize
+        << (base + usize(tid * TCB_STRIDE)) as *raw TaskControlBlock
+    }
+}
+
+pub fn tcb_name_ptr(tid int) *raw u8 {
+    unsafe {
+        base := (($&tcb_table[0]) as *raw TaskControlBlock) as usize
+        << (base + usize(tid * TCB_STRIDE + offsetof(TaskControlBlock, name_w0))) as *raw u8
+    }
+}
+
+fn set_tcb_name(tid int, name &string) {
+    $n := name.len
+    if n > 15 {
+        n = 15
+    }
+    unsafe {
+        tcb := tcb_at(tid)
+        (*tcb).name_len = n
+        (*tcb).name_w0 = u64(0)
+        (*tcb).name_w1 = u64(0)
+        base := tcb_name_ptr(tid) as usize
+        $i := 0
+        while i < n {
+            p := (base + usize(i)) as *raw u8
+            *p = u8(name[i])
+            i += 1
+        }
+    }
+}
+
+pub fn sched_init() {
+    unsafe {
+        mem.memset((($&g_sched_state) as *raw SchedState) as *raw u8, u8(0), sizeof(SchedState))
+        mem.memset((($&tcb_table[0]) as *raw TaskControlBlock) as *raw u8, u8(0), sizeof([MAX_TASKS]TaskControlBlock))
+        mem.memset((($&g_demo_state) as *raw DemoState) as *raw u8, u8(0), sizeof(DemoState))
+
+        st := sched_state()
+        *st = SchedState{
+            enabled: 0,
+            current_tid: 0,
+            task_count: 0,
+            next_tid: 0,
+            quantum_rem: DEFAULT_QUANTUM,
+            quantum_len: DEFAULT_QUANTUM,
+            total_switches: u64(0),
+            need_resched: 0,
+            lock: sync.irq_spinlock_new()
+        }
+
+        ds := demo_state()
+        *ds = DemoState{
+            worker_a_iters: u64(0),
+            worker_b_iters: u64(0),
+            worker_b_heap_ops: u64(0),
+            dyn_worker_iters: u64(0),
+            coop_step: 0,
+            shared_counter: u64(0),
+            shared_lock: sync.irq_spinlock_new()
+        }
+    }
+}
+
+@noreturn
+fn task_exit_trampoline() {
+    arch.cli()
+    unsafe {
+        st := sched_state()
+        cur := (*st).current_tid
+        if cur >= 0 && cur < MAX_TASKS {
+            tcb := tcb_at(cur)
+            (*tcb).state = task.TASK_DEAD
+        }
+    }
+    arch.sti()
+    while true {
+        arch.halt()
+    }
+}
+
+pub fn sched_spawn(name string, entry u64) int {
+    stack_base := pmm_alloc_contiguous(TASK_STACK_PAGES)
+    if stack_base == u64(0) {
+        << -1
+    }
+    stack_top := stack_base + u64(TASK_STACK_BYTES)
+
+    unsafe {
+        st := sched_state()
+        guard := (*st).lock.acquire()
+
+        $tid := -1
+        $i := 1
+        while i < MAX_TASKS {
+            t := tcb_at(i)
+            if (*t).state == task.TASK_UNUSED || (*t).state == task.TASK_DEAD {
+                if (*t).state == task.TASK_DEAD && (*t).stack_base != u64(0) {
+                    pmm_free_contiguous((*t).stack_base, TASK_STACK_PAGES)
+                }
+                tid = i
+                <-
+            }
+            i += 1
+        }
+        if tid < 0 {
+            pmm_free_contiguous(stack_base, TASK_STACK_PAGES)
+            << -1
+        }
+
+        ret_slot := (stack_top - u64(8)) as *raw u64
+        *ret_slot = task_exit_trampoline as u64
+
+        tf_addr := stack_top - u64(192) // 16 + 176 bytes TrapFrame
+        mem.memset(tf_addr as *raw u8, u8(0), 176)
+        tf := tf_addr as *raw task.TrapFrame
+        (*tf).rip = entry
+        (*tf).cs = u64(0x08)
+        (*tf).rflags = u64(0x202)
+        (*tf).rsp = stack_top - u64(8)
+        (*tf).ss = u64(0x10)
+
+        tcb := tcb_at(tid)
+        *tcb = TaskControlBlock{
+            tid: tid,
+            state: task.TASK_READY,
+            saved_rsp: tf_addr,
+            stack_base: stack_base,
+            stack_size: u64(TASK_STACK_BYTES),
+            ticks: u64(0),
+            switches: u64(0),
+            wake_tick: u64(0),
+            name_len: 0,
+            name_w0: u64(0),
+            name_w1: u64(0),
+            pad0: u64(0),
+            pad1: u64(0),
+            pad2: u64(0),
+            pad3: u64(0),
+            pad4: u64(0)
+        }
+        set_tcb_name(tid, &name)
+        (*st).task_count += 1
+        << tid
+    }
+}
+
+pub fn sched_sleep(ticks int) {
+    if ticks <= 0 {
+        <<
+    }
+    target := trap_ticks() + u64(ticks)
+    arch.cli()
+    unsafe {
+        st := sched_state()
+        cur := (*st).current_tid
+        if cur >= 0 && cur < MAX_TASKS {
+            tcb := tcb_at(cur)
+            (*tcb).wake_tick = target
+            (*tcb).state = task.TASK_BLOCKED
+        }
+    }
+    arch.sti()
+    while trap_ticks() < target {
+        arch.halt()
+    }
+}
+
+// Called only from IRQ0 trap_handler (IF=0). Must NOT acquire IrqSpinlock.
+pub fn sched_on_timer_tick(tf *raw task.TrapFrame) u64 {
+    unsafe {
+        st := sched_state()
+        now := trap_ticks()
+
+        // Wake any sleeping tasks whose wake_tick has arrived
+        $w := 0
+        while w < MAX_TASKS {
+            wt := tcb_at(w)
+            if (*wt).state == task.TASK_BLOCKED && now >= (*wt).wake_tick {
+                (*wt).state = task.TASK_READY
+            }
+            w += 1
+        }
+
+        if (*st).enabled == 0 {
+            << tf as u64
+        }
+
+        cur := (*st).current_tid
+        cur_tcb := tcb_at(cur)
+        (*cur_tcb).saved_rsp = tf as u64
+        (*cur_tcb).ticks += u64(1)
+
+        if (*cur_tcb).state == task.TASK_RUNNING && (*st).quantum_rem > 1 {
+            (*st).quantum_rem -= 1
+            << tf as u64
+        }
+
+        if (*cur_tcb).state == task.TASK_RUNNING {
+            (*cur_tcb).state = task.TASK_READY
+        }
+
+        // Round-robin over non-idle READY tasks first (tid 1 is idle)
+        $chosen := -1
+        $offset := 1
+        while offset <= MAX_TASKS {
+            cand := (cur + offset) % MAX_TASKS
+            if cand != 1 {
+                ct := tcb_at(cand)
+                if (*ct).state == task.TASK_READY {
+                    chosen = cand
+                    <-
+                }
+            }
+            offset += 1
+        }
+
+        // Fallback to idle task (tid 1) if no other task is READY
+        if chosen < 0 {
+            idle_tcb := tcb_at(1)
+            if (*idle_tcb).state == task.TASK_READY {
+                chosen = 1
+            } else {
+                chosen = cur
+            }
+        }
+
+        next_tcb := tcb_at(chosen)
+        (*next_tcb).state = task.TASK_RUNNING
+        (*st).quantum_rem = (*st).quantum_len
+
+        if chosen == cur {
+            << tf as u64
+        }
+
+        (*st).current_tid = chosen
+        (*st).total_switches += u64(1)
+        (*next_tcb).switches += u64(1)
+        << (*next_tcb).saved_rsp
+    }
+}
+
+@noreturn
+pub fn idle_entry() {
+    while true {
+        arch.halt()
+    }
+}
+
+@noreturn
+pub fn worker_a_entry() {
+    unsafe {
+        ds := demo_state()
+        while true {
+            if true {
+                guard := (*ds).shared_lock.acquire()
+                (*ds).worker_a_iters += u64(1)
+                (*ds).shared_counter += u64(1)
+            }
+            sched_sleep(2)
+        }
+    }
+}
+
+@noreturn
+pub fn worker_b_entry() {
+    unsafe {
+        ds := demo_state()
+        while true {
+            buf := kmalloc(64)
+            if buf != 0 as *raw u8 {
+                p := buf as *raw u64
+                *p = u64(0x3EEFCAFE12345678)
+                if *p == u64(0x3EEFCAFE12345678) {
+                    (*ds).worker_b_heap_ops += u64(1)
+                }
+                kfree(buf)
+            }
+            if true {
+                guard := (*ds).shared_lock.acquire()
+                (*ds).worker_b_iters += u64(1)
+                (*ds).shared_counter += u64(1)
+            }
+            sched_sleep(3)
+        }
+    }
+}
+
+pub fn dyn_worker_entry() {
+    unsafe {
+        ds := demo_state()
+        $i := 0
+        while i < 10 {
+            if true {
+                guard := (*ds).shared_lock.acquire()
+                (*ds).dyn_worker_iters += u64(1)
+                (*ds).shared_counter += u64(1)
+            }
+            sched_sleep(1)
+            i += 1
+        }
+    }
+}
+
+@noreturn
+fn coop_worker_entry() {
+    unsafe {
+        ds := demo_state()
+        (*ds).coop_step = 1
+        cm := ($&coop_ctxs[0]) as *raw task.TaskContext
+        c1 := ($&coop_ctxs[1]) as *raw task.TaskContext
+        task.switch_context(c1, cm)
+    }
+    while true {
+        arch.halt()
+    }
+}
+
+pub fn coop_switch_self_test() bool {
+    unsafe {
+        cm := ($&coop_ctxs[0]) as *raw task.TaskContext
+        c1 := ($&coop_ctxs[1]) as *raw task.TaskContext
+        mem.memset(cm as *raw u8, u8(0), sizeof([2]task.TaskContext))
+        coop_stack_top := ((($&coop_stack[0]) as *raw u8) as u64) + u64(sizeof([PAGE_SIZE]u8))
+
+        ds := demo_state()
+        (*ds).coop_step = 0
+
+        $t1 := task.task_context_new()
+        t1.init(coop_worker_entry as u64, coop_stack_top)
+        *c1 = t1
+
+        task.switch_context(cm, c1)
+        << (*ds).coop_step == 1
+    }
+}
+
+pub fn sched_start() {
+    unsafe {
+        tcb0 := tcb_at(0)
+        *tcb0 = TaskControlBlock{
+            tid: 0,
+            state: task.TASK_RUNNING,
+            saved_rsp: u64(0),
+            stack_base: u64(0),
+            stack_size: u64(0),
+            ticks: u64(0),
+            switches: u64(1),
+            wake_tick: u64(0),
+            name_len: 0,
+            name_w0: u64(0),
+            name_w1: u64(0),
+            pad0: u64(0),
+            pad1: u64(0),
+            pad2: u64(0),
+            pad3: u64(0),
+            pad4: u64(0)
+        }
+        shell_name := "shell"
+        set_tcb_name(0, &shell_name)
+
+        st := sched_state()
+        (*st).current_tid = 0
+        (*st).task_count += 1
+        (*st).enabled = 1
+    }
+
+    idt_enable_irqs()
+    arch.sti()
+    shell_run()
+}

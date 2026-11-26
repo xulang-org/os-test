@@ -1,0 +1,675 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/task
+
+const SHELL_BUF_CAP = 120
+const SHELL_RING_CAP = 256
+const NUM_SHELL_CMDS = 23
+
+@repr("C")
+pub struct ShellState {
+    pub line_len int
+    pub cmd_count u64
+    pub running int
+}
+
+@repr("C")
+struct ShellCmd {
+    pub name    [12]u8
+    pub desc    *raw u8
+    pub handler *raw u8
+}
+
+static $g_shell_state ShellState
+static $shell_buf [SHELL_RING_CAP]u8
+
+fn serial_put_cstr(s *raw u8) {
+    unsafe {
+        $p := s
+        while *p != u8(0) {
+            serial_putc(*p)
+            p = ((p as int) + 1) as *raw u8
+        }
+    }
+}
+
+fn cmd_name_eq(buf *raw u8, len int, name_arr *raw u8) bool {
+    $i := 0
+    while i < 12 {
+        unsafe {
+            c := *(((name_arr as int) + i) as *raw u8)
+            if c == u8(0) {
+                << i == len
+            }
+            if i >= len {
+                << false
+            }
+            bc := *(((buf as int) + i) as *raw u8)
+            if bc != c {
+                << false
+            }
+        }
+        i += 1
+    }
+    << len == 12
+}
+
+fn shell_state() *raw ShellState {
+    unsafe {
+        << ($&g_shell_state) as *raw ShellState
+    }
+}
+
+fn put_u32_chars(w u32) {
+    serial_putc(u8(w & u32(0xFF)))
+    serial_putc(u8((w >> u32(8)) & u32(0xFF)))
+    serial_putc(u8((w >> u32(16)) & u32(0xFF)))
+    serial_putc(u8((w >> u32(24)) & u32(0xFF)))
+}
+
+fn cmd_info() {
+    unsafe {
+        bi := boot_info()
+        ts := trap_stats()
+        vs := vmm_state()
+        cr3 := arch.read_cr3()
+        $cp0 := arch.CpuidResult{eax: u32(0), ebx: u32(0), ecx: u32(0), edx: u32(0)}
+        arch.cpuid(u32(0), u32(0), (&cp0) as *raw arch.CpuidResult)
+        serial_puts("Xu x86_64 Long Mode Microkernel\n")
+        serial_puts("  CPU Vendor     : ")
+        put_u32_chars(cp0.ebx)
+        put_u32_chars(cp0.edx)
+        put_u32_chars(cp0.ecx)
+        serial_puts("  NXE=")
+        if (*vs).nx_enabled != 0 { serial_puts("1") } else { serial_puts("0") }
+        serial_puts("  DemandPFs=")
+        serial_put_dec(int((*vs).demand_faults))
+        serial_puts("\n  BootInfo magic : ")
+        serial_put_hex((*bi).magic)
+        serial_puts("  MB magic: ")
+        serial_put_hex((*bi).mb_magic)
+        serial_puts("\n  Upper RAM (KiB): ")
+        serial_put_dec(int((*bi).mem_upper_kb))
+        serial_puts("\n  CR3            : ")
+        serial_put_hex(cr3)
+        serial_puts("\n  PIT Ticks      : ")
+        serial_put_dec(int((*ts).timer_ticks))
+        serial_puts(" (100 Hz)\n  Serial IRQs    : ")
+        serial_put_dec(int((*ts).serial_irqs))
+        serial_puts("  Total IRQs: ")
+        serial_put_dec(int((*ts).total_irqs))
+        serial_puts("\n")
+    }
+}
+
+fn cmd_mem() {
+    unsafe {
+        ps := pmm_state()
+        vs := vmm_state()
+        hs := heap_state()
+        serial_puts("[PMM]  total=")
+        serial_put_dec((*ps).total_frames)
+        serial_puts(" free=")
+        serial_put_dec((*ps).free_frames)
+        serial_puts(" used=")
+        serial_put_dec((*ps).used_frames)
+        serial_puts(" reserved=")
+        serial_put_dec((*ps).reserved_frames)
+        serial_puts(" frames (")
+        serial_put_dec((*ps).free_frames * 4)
+        serial_puts(" KiB free)\n")
+
+        serial_puts("[VMM]  kernel_pml4=")
+        serial_put_hex((*vs).kernel_pml4)
+        serial_puts(" pt_frames=")
+        serial_put_dec((*vs).pt_frames_allocated)
+        serial_puts(" mapped_4k=")
+        serial_put_dec((*vs).active_mapped_pages)
+        serial_puts("\n")
+
+        serial_puts("[HEAP] base=")
+        serial_put_hex((*hs).base)
+        serial_puts(" size=")
+        serial_put_dec(int((*hs).size))
+        serial_puts(" used=")
+        serial_put_dec(int((*hs).bytes_used))
+        serial_puts(" free=")
+        serial_put_dec(int((*hs).bytes_free))
+        serial_puts(" blocks=")
+        serial_put_dec((*hs).block_count)
+        serial_puts(" allocs=")
+        serial_put_dec(int((*hs).total_allocs))
+        serial_puts(" frees=")
+        serial_put_dec(int((*hs).total_frees))
+        serial_puts("\n")
+    }
+}
+
+fn print_task_state(st int) {
+    if st == task.TASK_READY {
+        serial_puts("READY  ")
+    } else if st == task.TASK_RUNNING {
+        serial_puts("RUNNING")
+    } else if st == task.TASK_BLOCKED {
+        serial_puts("SLEEP  ")
+    } else if st == task.TASK_DEAD {
+        serial_puts("DEAD   ")
+    } else {
+        serial_puts("UNUSED ")
+    }
+}
+
+fn cmd_ps() {
+    unsafe {
+        ss := sched_state()
+        ds := demo_state()
+        serial_puts("TID  STATE    TICKS     SWITCHES  NAME\n")
+        $i := 0
+        while i < 16 {
+            t := tcb_at(i)
+            if (*t).state != task.TASK_UNUSED {
+                serial_put_dec((*t).tid)
+                serial_puts("    ")
+                print_task_state((*t).state)
+                serial_puts("  ")
+                serial_put_dec(int((*t).ticks))
+                serial_puts("         ")
+                serial_put_dec(int((*t).switches))
+                serial_puts("         ")
+                serial_put_buf(tcb_name_ptr(i), (*t).name_len)
+                serial_puts("\n")
+            }
+            i += 1
+        }
+        serial_puts("Total switches=")
+        serial_put_dec(int((*ss).total_switches))
+        serial_puts(" worker_a=")
+        serial_put_dec(int((*ds).worker_a_iters))
+        serial_puts(" worker_b=")
+        serial_put_dec(int((*ds).worker_b_iters))
+        serial_puts(" heap_ops=")
+        serial_put_dec(int((*ds).worker_b_heap_ops))
+        serial_puts(" dyn_worker=")
+        serial_put_dec(int((*ds).dyn_worker_iters))
+        serial_puts(" shared=")
+        serial_put_dec(int((*ds).shared_counter))
+        serial_puts("\n")
+    }
+}
+
+fn cmd_uptime() {
+    t := int(trap_ticks())
+    serial_puts("Uptime: Ticks=")
+    serial_put_dec(t)
+    serial_puts(" (")
+    serial_put_dec(t * 10)
+    serial_puts(" ms)\n")
+}
+
+fn cmd_selftest(coop_ok bool) {
+    $passed := 0
+
+    // 1. PIT Timer IRQ advancing
+    t0 := trap_ticks()
+    sched_sleep(6)
+    t1 := trap_ticks()
+    if t1 > t0 {
+        serial_puts("[PASS] 1/15 PIT Timer IRQ 100Hz (ticks ")
+        serial_put_dec(int(t0))
+        serial_puts(" -> ")
+        serial_put_dec(int(t1))
+        serial_puts(")\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 1/15 PIT Timer IRQ did not advance\n")
+    }
+
+    // 2. PMM
+    if pmm_self_test() {
+        serial_puts("[PASS] 2/15 PMM Bitmap Allocator\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 2/15 PMM Bitmap Allocator\n")
+    }
+
+    // 3. VMM
+    if vmm_self_test() {
+        serial_puts("[PASS] 3/15 VMM 4-Level Paging (CR3/INVLPG)\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 3/15 VMM 4-Level Paging\n")
+    }
+
+    // 4. Heap
+    if heap_self_test() {
+        serial_puts("[PASS] 4/15 Kernel Heap Split/Coalesce\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 4/15 Kernel Heap Split/Coalesce\n")
+    }
+
+    // 5. Cooperative Context Switch
+    if coop_ok {
+        serial_puts("[PASS] 5/15 Cooperative Context Switch (#core/task.switch_context)\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 5/15 Cooperative Context Switch\n")
+    }
+
+    // 6. Preemptive Multitasking
+    sched_sleep(8)
+    unsafe {
+        ss := sched_state()
+        ds := demo_state()
+        if (*ds).worker_a_iters > u64(0) && (*ds).worker_b_iters > u64(0) && (*ss).total_switches > u64(0) {
+            serial_puts("[PASS] 6/15 Preemptive Multitasking (switches=")
+            serial_put_dec(int((*ss).total_switches))
+            serial_puts(" A=")
+            serial_put_dec(int((*ds).worker_a_iters))
+            serial_puts(" B=")
+            serial_put_dec(int((*ds).worker_b_iters))
+            serial_puts(")\n")
+            passed += 1
+        } else {
+            serial_puts("[FAIL] 6/15 Preemptive Multitasking\n")
+        }
+
+        // 7. IrqSpinlock RAII & Shared Counter + Worker Heap Ops
+        if (*ds).shared_counter > u64(0) && (*ds).worker_b_heap_ops > u64(0) {
+            serial_puts("[PASS] 7/15 IrqSpinlock RAII & Concurrent Heap (shared=")
+            serial_put_dec(int((*ds).shared_counter))
+            serial_puts(" heap_ops=")
+            serial_put_dec(int((*ds).worker_b_heap_ops))
+            serial_puts(")\n")
+            passed += 1
+        } else {
+            serial_puts("[FAIL] 7/15 IrqSpinlock RAII\n")
+        }
+    }
+
+    // 8. Ring 3 User Mode & SYSCALL/SYSRET
+    if user_self_test() {
+        serial_puts("[PASS] 8/15 Ring 3 User Mode & SYSCALL/SYSRET\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 8/15 Ring 3 User Mode & SYSCALL/SYSRET\n")
+    }
+
+    // 9. VirtIO-Blk PCI DMA Read/Write
+    if blk_self_test() {
+        serial_puts("[PASS] 9/15 VirtIO-Blk PCI DMA Read/Write\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 9/15 VirtIO-Blk PCI DMA Read/Write\n")
+    }
+
+    // 10. Persistent XuFS on VirtIO-Blk
+    if fs_self_test() {
+        serial_puts("[PASS] 10/15 Persistent XuFS Read/Write/Remount\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 10/15 Persistent XuFS Read/Write/Remount\n")
+    }
+
+    // 11. Pure-Xu Ring 3 ELF64 Loader + Per-Process PML4 + W^X/NX
+    if elf_self_test() {
+        serial_puts("[PASS] 11/15 Pure-Xu Ring3 ELF64 Loader (W^X + NX + Per-Process CR3)\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 11/15 Pure-Xu Ring3 ELF64 Loader\n")
+    }
+
+    // 12. Demand Paging #PF + Ring 3 Fault Containment
+    if pf_self_test() {
+        serial_puts("[PASS] 12/15 Demand Paging #PF + Ring3 Fault Containment\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 12/15 Demand Paging #PF + Ring3 Fault Containment\n")
+    }
+
+    // 13. Unmodified Linux x86_64 ELF64 App
+    if linux_app_self_test() {
+        serial_puts("[PASS] 13/15 Unmodified Linux x86_64 ELF64 App\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 13/15 Unmodified Linux x86_64 ELF64 App\n")
+    }
+
+    // 14. Unmodified macOS x86_64 Mach-O App
+    if macos_app_self_test() {
+        serial_puts("[PASS] 14/15 Unmodified macOS x86_64 Mach-O App\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 14/15 Unmodified macOS x86_64 Mach-O App\n")
+    }
+
+    // 15. Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)
+    if ui_desktop_self_test() {
+        serial_puts("[PASS] 15/15 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 15/15 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
+    }
+
+    if passed == 15 {
+        serial_puts("[SELFTEST] ALL 15 CHECKS PASSED\n")
+    } else {
+        serial_puts("[SELFTEST] FAILED: ")
+        serial_put_dec(15 - passed)
+        serial_puts(" checks failed\n")
+    }
+    gui_force_redraw()
+}
+
+fn cmd_help_h(coop_ok bool) {
+    serial_puts("Available commands:\n")
+    for idx in 0:NUM_SHELL_CMDS {
+        serial_puts("  ")
+        $len := 0
+        unsafe {
+            np := (&shell_cmds[idx].name[0]) as *raw u8
+            while len < 12 {
+                c := *(((np as int) + len) as *raw u8)
+                if c == u8(0) {
+                    <-
+                }
+                serial_putc(c)
+                len += 1
+            }
+            while len < 10 {
+                serial_putc(u8(32))
+                len += 1
+            }
+            serial_puts("- ")
+            serial_put_cstr(shell_cmds[idx].desc)
+            serial_puts("\n")
+        }
+    }
+}
+
+fn cmd_info_h(coop_ok bool) { cmd_info() }
+fn cmd_mem_h(coop_ok bool) { cmd_mem() }
+fn cmd_ps_h(coop_ok bool) { cmd_ps() }
+fn cmd_uptime_h(coop_ok bool) { cmd_uptime() }
+
+fn cmd_vmtest_h(coop_ok bool) {
+    if vmm_self_test() {
+        serial_puts("[VMM] PASS\n")
+    } else {
+        serial_puts("[VMM] FAIL\n")
+    }
+}
+
+fn cmd_heaptest_h(coop_ok bool) {
+    if heap_self_test() {
+        serial_puts("[HEAP] PASS\n")
+    } else {
+        serial_puts("[HEAP] FAIL\n")
+    }
+}
+
+fn cmd_usertest_h(coop_ok bool) {
+    if user_self_test() {
+        serial_puts("[USER] PASS\n")
+    } else {
+        serial_puts("[USER] FAIL\n")
+    }
+}
+
+fn cmd_blktest_h(coop_ok bool) {
+    if blk_self_test() {
+        serial_puts("[BLK] PASS\n")
+    } else {
+        serial_puts("[BLK] FAIL\n")
+    }
+}
+
+fn cmd_spawn_h(coop_ok bool) {
+    tid := sched_spawn("dyn_worker", dyn_worker_entry as u64)
+    if tid >= 0 {
+        serial_puts("[SCHED] Spawned dyn_worker tid=")
+        serial_put_dec(tid)
+        serial_puts("\n")
+    } else {
+        serial_puts("[SCHED] Spawn failed\n")
+    }
+}
+
+fn cmd_ls_h(coop_ok bool) {
+    fs_list()
+}
+
+fn cmd_cat_h(coop_ok bool) {
+    motd := "/etc/motd"
+    page := pmm_alloc_frame()
+    if page == u64(0) {
+        serial_puts("[FS] Out of memory\n")
+        <<
+    }
+    p_path := page as *raw u8
+    p_out := (page + u64(128)) as *raw u8
+    unsafe {
+        for i in 0:motd.len {
+            *(((p_path as usize) + usize(i)) as *raw u8) = u8(motd[i])
+        }
+    }
+    n := fs_read(p_path, motd.len, p_out, 256)
+    if n > 0 {
+        serial_put_buf(p_out, n)
+    } else {
+        serial_puts("[FS] Failed to read /etc/motd\n")
+    }
+    pmm_free_frame(page)
+}
+
+fn cmd_fstest_h(coop_ok bool) {
+    if fs_self_test() {
+        serial_puts("[FS] PASS\n")
+    } else {
+        serial_puts("[FS] FAIL\n")
+    }
+}
+
+fn cmd_elftest_h(coop_ok bool) {
+    if elf_self_test() {
+        serial_puts("[ELF] PASS\n")
+    } else {
+        serial_puts("[ELF] FAIL\n")
+    }
+}
+
+fn cmd_pftest_h(coop_ok bool) {
+    if pf_self_test() {
+        serial_puts("[PF] PASS\n")
+    } else {
+        serial_puts("[PF] FAIL\n")
+    }
+}
+
+fn cmd_clear_h(coop_ok bool) {
+    gui_term_clear()
+}
+
+fn cmd_selftest_h(coop_ok bool) { cmd_selftest(coop_ok) }
+
+fn cmd_ui_h(coop_ok bool) {
+    user_run_desktop_session(false)
+}
+
+fn cmd_uimac_h(coop_ok bool) {
+    user_run_desktop_session(true)
+}
+
+fn cmd_linuxtest_h(coop_ok bool) {
+    if linux_app_self_test() {
+        serial_puts("[LINUX] PASS\n")
+    } else {
+        serial_puts("[LINUX] FAIL\n")
+    }
+}
+
+fn cmd_mactest_h(coop_ok bool) {
+    if macos_app_self_test() {
+        serial_puts("[MACOS] PASS\n")
+    } else {
+        serial_puts("[MACOS] FAIL\n")
+    }
+}
+
+fn cmd_uitest_h(coop_ok bool) {
+    if ui_desktop_self_test() {
+        serial_puts("[UI] PASS\n")
+    } else {
+        serial_puts("[UI] FAIL\n")
+    }
+}
+
+fn cmd_poweroff_h(coop_ok bool) {
+    serial_puts("[KERNEL] Powering off QEMU...\n")
+    unsafe {
+        arch.out16(u16(0x0604), u16(0x2000))
+        arch.out16(u16(0xB004), u16(0x2000))
+    }
+    arch.cli()
+    kernel_halt_forever()
+}
+
+static shell_cmds [NUM_SHELL_CMDS]ShellCmd = [
+    ShellCmd{name: "help",      desc: "Show this command list",                            handler: (cmd_help_h) as *raw u8},
+    ShellCmd{name: "info",      desc: "Show CPU, BootInfo, CR3, and IRQ stats",            handler: (cmd_info_h) as *raw u8},
+    ShellCmd{name: "mem",       desc: "Show PMM, VMM, and Heap allocator stats",           handler: (cmd_mem_h) as *raw u8},
+    ShellCmd{name: "ps",        desc: "Show preemptive task table and worker counters",    handler: (cmd_ps_h) as *raw u8},
+    ShellCmd{name: "uptime",    desc: "Show PIT timer ticks (100 Hz)",                     handler: (cmd_uptime_h) as *raw u8},
+    ShellCmd{name: "vmtest",    desc: "Run 4-level VMM map/RW/translate/unmap test",       handler: (cmd_vmtest_h) as *raw u8},
+    ShellCmd{name: "heaptest",  desc: "Run kmalloc/kfree split & coalesce test",           handler: (cmd_heaptest_h) as *raw u8},
+    ShellCmd{name: "usertest",  desc: "Run Ring 3 user mode & SYSCALL/SYSRET test",        handler: (cmd_usertest_h) as *raw u8},
+    ShellCmd{name: "blktest",   desc: "Run VirtIO-Blk PCI DMA read/write test",            handler: (cmd_blktest_h) as *raw u8},
+    ShellCmd{name: "ls",        desc: "List files in persistent XuFS filesystem",          handler: (cmd_ls_h) as *raw u8},
+    ShellCmd{name: "cat",       desc: "Print /etc/motd from XuFS",                         handler: (cmd_cat_h) as *raw u8},
+    ShellCmd{name: "fstest",    desc: "Run persistent XuFS read/write/remount test",       handler: (cmd_fstest_h) as *raw u8},
+    ShellCmd{name: "elftest",   desc: "Load & run pure-Xu Ring 3 ELF64 (/bin/hello.elf)",  handler: (cmd_elftest_h) as *raw u8},
+    ShellCmd{name: "pftest",    desc: "Run demand paging & Ring 3 #PF containment test",   handler: (cmd_pftest_h) as *raw u8},
+    ShellCmd{name: "linuxtest", desc: "Run unmodified Linux x86_64 ELF64 guest app",       handler: (cmd_linuxtest_h) as *raw u8},
+    ShellCmd{name: "mactest",   desc: "Run unmodified macOS x86_64 Mach-O guest app",      handler: (cmd_mactest_h) as *raw u8},
+    ShellCmd{name: "uitest",    desc: "Run #ui/widgets Ring 3 smoke test (Linux+macOS)",   handler: (cmd_uitest_h) as *raw u8},
+    ShellCmd{name: "ui",        desc: "Launch #ui/widgets Ring 3 desktop (Linux ELF64)",   handler: (cmd_ui_h) as *raw u8},
+    ShellCmd{name: "uimac",     desc: "Launch #ui/widgets Ring 3 desktop (macOS Mach-O)",  handler: (cmd_uimac_h) as *raw u8},
+    ShellCmd{name: "clear",     desc: "Clear GUI terminal screen",                         handler: (cmd_clear_h) as *raw u8},
+    ShellCmd{name: "spawn",     desc: "Spawn dynamic kernel worker task",                  handler: (cmd_spawn_h) as *raw u8},
+    ShellCmd{name: "selftest",  desc: "Run full 15-part OS verification suite",            handler: (cmd_selftest_h) as *raw u8},
+    ShellCmd{name: "poweroff",  desc: "Cleanly shut down QEMU",                            handler: (cmd_poweroff_h) as *raw u8}
+]
+
+fn shell_dispatch(buf *raw u8, len int, coop_ok bool) {
+    if len == 0 {
+        <<
+    }
+    for idx in 0:NUM_SHELL_CMDS {
+        $matched := false
+        unsafe {
+            matched = cmd_name_eq(buf, len, (&shell_cmds[idx].name[0]) as *raw u8)
+        }
+        if matched {
+            $h := cmd_help_h
+            unsafe {
+                h = (shell_cmds[idx].handler) as fn(bool)
+            }
+            h(coop_ok)
+            <<
+        }
+    }
+    serial_puts("Unknown command: ")
+    serial_put_buf(buf, len)
+    serial_puts(" (type 'help')\n")
+}
+
+@noreturn
+pub fn shell_run() {
+    $coop_ok := false
+    $buf := 0 as *raw u8
+    unsafe {
+        mem.memset((($&g_shell_state) as *raw ShellState) as *raw u8, u8(0), sizeof(ShellState))
+        buf = ($&shell_buf[0]) as *raw u8
+        mem.memset(buf, u8(0), sizeof([SHELL_RING_CAP]u8))
+        ds := demo_state()
+        coop_ok = (*ds).coop_step == 1
+        st := shell_state()
+        *st = ShellState{
+            line_len: 0,
+            cmd_count: u64(0),
+            running: 1
+        }
+    }
+
+    if boot_auto_ui() && fb_is_ready() {
+        user_run_desktop_session(false)
+    }
+
+    serial_puts("\nxu-os> ")
+    gui_force_redraw()
+
+    while true {
+        gui_tick()
+
+        gui_cmd_len := gui_poll_command(buf, SHELL_BUF_CAP)
+        if gui_cmd_len > 0 {
+            serial_put_buf(buf, gui_cmd_len)
+            serial_puts("\n")
+            unsafe {
+                st := shell_state()
+                (*st).line_len = 0
+                (*st).cmd_count += u64(1)
+            }
+            shell_dispatch(buf, gui_cmd_len, coop_ok)
+            serial_puts("xu-os> ")
+            gui_force_redraw()
+            ->
+        }
+
+        $ch := serial_try_getc()
+        if ch < 0 {
+            ch = kbd_try_getc()
+        }
+        if ch < 0 {
+            arch.halt()
+            ->
+        }
+
+        if ch == 13 || ch == 10 {
+            serial_puts("\n")
+            $len := 0
+            unsafe {
+                st := shell_state()
+                len = (*st).line_len
+                (*st).line_len = 0
+                (*st).cmd_count += u64(1)
+            }
+            shell_dispatch(buf, len, coop_ok)
+            serial_puts("xu-os> ")
+            gui_force_redraw()
+        } else if ch == 8 || ch == 127 {
+            unsafe {
+                st := shell_state()
+                if (*st).line_len > 0 {
+                    (*st).line_len -= 1
+                    serial_putc(u8(8))
+                    serial_putc(u8(32))
+                    serial_putc(u8(8))
+                }
+            }
+        } else if ch >= 32 && ch < 127 {
+            unsafe {
+                st := shell_state()
+                if (*st).line_len < SHELL_BUF_CAP {
+                    p := ((buf as int) + (*st).line_len) as *raw u8
+                    *p = u8(ch)
+                    (*st).line_len += 1
+                    serial_putc(u8(ch))
+                }
+            }
+        }
+    }
+}

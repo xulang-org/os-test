@@ -1,0 +1,5 @@
+@os_test/kmeta
+$freestanding
+
+pub static $boot_verified bool = false
+pub static kernel_ver_tag [8]u8 = "v0.14.1"

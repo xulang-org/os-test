@@ -1,0 +1,147 @@
+@main
+$freestanding
+
+#core/arch
+#os_test/kmeta
+
+static $kernel_boot_sig u64 = 0x58554F5300030400u64
+
+@section(".rodata.boot")
+static kernel_abi_tag [4]u8 = "XUOS"
+
+static kernel_boot_info_ptr *raw BootInfo = (&os_boot_info) as *raw BootInfo
+static kernel_boot_ok_msg *raw u8 = "[BOOT] ELF .rodata/.rodata.boot/.data/.bss/.rela.rodata & #kmeta verified.\n"
+
+@noreturn
+pub fn kernel_halt_forever() {
+    while true {
+        arch.halt()
+    }
+}
+
+@panic_handler
+pub fn kernel_panic(kind int) {
+    arch.cli()
+    serial_puts("\n[KERNEL PANIC] Runtime panic kind=")
+    serial_put_dec(kind)
+    serial_puts("\n")
+    while true {
+        arch.halt()
+    }
+}
+
+fn main() int {
+    arch.cli()
+    serial_init()
+
+    serial_puts("\n====================================================\n")
+    serial_puts("  Xu OS Test Kernel (x86_64 Long Mode, Freestanding)\n")
+    serial_puts("  IDT/PIC/PIT + PMM + 4-Level VMM + Heap + Preempt  \n")
+    serial_puts("====================================================\n")
+
+    unsafe {
+        if kernel_boot_sig != u64(0x58554F5300030400) {
+            serial_puts("[BOOT] FATAL: .data initial signature mismatch\n")
+            kernel_halt_forever()
+        }
+        kernel_boot_sig += u64(1)
+        if kernel_boot_sig != u64(0x58554F5300030401) {
+            serial_puts("[BOOT] FATAL: .data mutation mismatch\n")
+            kernel_halt_forever()
+        }
+        if kernel_abi_tag[0] != u8(88) || kernel_abi_tag[1] != u8(85) || kernel_abi_tag[2] != u8(79) || kernel_abi_tag[3] != u8(83) {
+            serial_puts("[BOOT] FATAL: .rodata.boot tag mismatch\n")
+            kernel_halt_forever()
+        }
+        if kernel_boot_info_ptr != boot_info() || (*kernel_boot_info_ptr).magic != u64(0x58554F53) {
+            serial_puts("[BOOT] FATAL: .rela.rodata boot_info relocation mismatch\n")
+            kernel_halt_forever()
+        }
+        if kmeta.kernel_ver_tag[0] != u8(118) || kmeta.boot_verified {
+            serial_puts("[BOOT] FATAL: #os_test/kmeta pub static mismatch\n")
+            kernel_halt_forever()
+        }
+        kmeta.boot_verified = true
+        if !kmeta.boot_verified {
+            serial_puts("[BOOT] FATAL: #os_test/kmeta pub static write mismatch\n")
+            kernel_halt_forever()
+        }
+        $p := kernel_boot_ok_msg
+        while *p != u8(0) {
+            serial_putc(*p)
+            p = ((p as int) + 1) as *raw u8
+        }
+    }
+
+    idt_init()
+    serial_puts("[BOOT] IDT (48 vectors), PIC 8259A, PIT 100 Hz initialized.\n")
+
+    pmm_init()
+    serial_puts("[BOOT] PMM bitmap frame allocator initialized (")
+    serial_put_dec(pmm_free_frames())
+    serial_puts(" frames free).\n")
+
+    if !vmm_init() {
+        serial_puts("[BOOT] FATAL: VMM initialization failed.\n")
+        kernel_halt_forever()
+    }
+    serial_puts("[BOOT] VMM 4-level paging active, CR3=")
+    serial_put_hex(vmm_kernel_pml4())
+    serial_puts("\n")
+
+    if !heap_init(256) {
+        serial_puts("[BOOT] FATAL: Heap initialization failed.\n")
+        kernel_halt_forever()
+    }
+    serial_puts("[BOOT] Kernel Heap initialized (1024 KiB).\n")
+
+    user_init()
+    serial_puts("[BOOT] GDT/TSS (64-bit) & SYSCALL/SYSRET MSRs configured.\n")
+
+    if fb_init() {
+        input_init()
+        gui_init()
+        serial_puts("[BOOT] Framebuffer 1280x800x32 (Bochs VBE) & PS/2 input ready.\n")
+    } else {
+        serial_puts("[BOOT] Bochs VBE framebuffer not detected; serial-only mode.\n")
+    }
+
+    if blk_init() {
+        serial_puts("[BOOT] VirtIO-Blk PCI driver ready (")
+        serial_put_dec(int(blk_capacity_sectors()))
+        serial_puts(" sectors).\n")
+        if fs_mount() {
+            serial_puts("[BOOT] XuFS mounted on VirtIO-Blk (")
+            serial_put_dec(fs_file_count())
+            serial_puts(" files).\n")
+        } else {
+            serial_puts("[BOOT] WARNING: XuFS mount failed.\n")
+        }
+    } else {
+        serial_puts("[BOOT] VirtIO-Blk PCI device not attached.\n")
+    }
+
+    sched_init()
+    if coop_switch_self_test() {
+        serial_puts("[BOOT] Cooperative #core/task.switch_context test PASSED.\n")
+    } else {
+        serial_puts("[BOOT] WARNING: Cooperative switch_context test FAILED.\n")
+    }
+
+    idle_tid := sched_spawn("idle", idle_entry as u64)
+    wa_tid := sched_spawn("worker_a", worker_a_entry as u64)
+    wb_tid := sched_spawn("worker_b", worker_b_entry as u64)
+    serial_puts("[BOOT] Spawned tasks: idle=")
+    serial_put_dec(idle_tid)
+    serial_puts(" worker_a=")
+    serial_put_dec(wa_tid)
+    serial_puts(" worker_b=")
+    serial_put_dec(wb_tid)
+    serial_puts("\n")
+
+    serial_puts("[BOOT] Enabling interrupts and starting preemptive scheduler...\n")
+    sched_start()
+
+    kernel_halt_forever()
+    << 0
+}

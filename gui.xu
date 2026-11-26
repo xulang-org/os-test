@@ -1,0 +1,778 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+
+const TERM_COLS = 72
+const TERM_ROWS = 34
+const TERM_CELLS = 2448 // 72 * 34
+const TITLE_H = 26
+const TOPBAR_H = 32
+const DOCK_Y = 740
+const DOCK_H = 48
+const NUM_DOCK_BTNS = 8
+
+// Palette (Slate / Indigo OS Desktop)
+const COL_BG_TOP    = 0x0F172A
+const COL_BG_BOT    = 0x1E293B
+const COL_TOPBAR    = 0x0B1120
+const COL_TOP_LINE  = 0x334155
+const COL_WIN_BG    = 0x111827
+const COL_WIN_HDR   = 0x1E293B
+const COL_WIN_ACT   = 0x312E81
+const COL_BORDER    = 0x334155
+const COL_BORDER_HI = 0x6366F1
+const COL_TEXT      = 0xE2E8F0
+const COL_MUTED     = 0x94A3B8
+const COL_GREEN     = 0x4ADE80
+const COL_RED       = 0xF87171
+const COL_CYAN      = 0x38BDF8
+const COL_AMBER     = 0xFBBF24
+const COL_INDIGO    = 0x818CF8
+const COL_BAR_BG    = 0x1E293B
+const COL_DOCK_BG   = 0x0F172A
+const COL_BTN_BG    = 0x1E293B
+const COL_BTN_HOV   = 0x3730A3
+const COL_BTN_RED   = 0x991B1B
+const COL_BTN_RED_H = 0xDC2626
+
+@repr("C")
+pub struct GuiWindow {
+    pub x int
+    pub y int
+    pub w int
+    pub h int
+}
+
+@repr("C")
+pub struct GuiState {
+    pub ready int
+    pub dirty int
+    pub force_draw int
+    pub term_row int
+    pub term_col int
+    pub drag_win int
+    pub drag_off_x int
+    pub drag_off_y int
+    pub selected_file int
+    pub pending_len int
+    pub last_draw_tick u64
+    pub frame_count u64
+    pub win_order [3]int
+    pub wins [3]GuiWindow
+}
+
+static $g_gui GuiState
+static $term_chars [TERM_CELLS]u8
+static $term_row_tag [TERM_ROWS]u8
+static $pending_cmd [64]u8
+static $xufs_name_buf [40]u8
+
+// 12x16 arrow cursor bitmap: 0=transparent, 1=black outline, 2=white fill
+static cursor_bmp [192]u8 = [
+    1,0,0,0,0,0,0,0,0,0,0,0,
+    1,1,0,0,0,0,0,0,0,0,0,0,
+    1,2,1,0,0,0,0,0,0,0,0,0,
+    1,2,2,1,0,0,0,0,0,0,0,0,
+    1,2,2,2,1,0,0,0,0,0,0,0,
+    1,2,2,2,2,1,0,0,0,0,0,0,
+    1,2,2,2,2,2,1,0,0,0,0,0,
+    1,2,2,2,2,2,2,1,0,0,0,0,
+    1,2,2,2,2,2,2,2,1,0,0,0,
+    1,2,2,2,2,2,2,2,2,1,0,0,
+    1,2,2,2,2,2,1,1,1,1,1,0,
+    1,2,2,1,2,2,1,0,0,0,0,0,
+    1,2,1,0,1,2,2,1,0,0,0,0,
+    1,1,0,0,1,2,2,1,0,0,0,0,
+    1,0,0,0,0,1,2,1,0,0,0,0,
+    0,0,0,0,0,1,1,0,0,0,0,0
+]
+
+fn gui_state() *raw GuiState {
+    unsafe {
+        << ($&g_gui) as *raw GuiState
+    }
+}
+
+fn gui_queue_cmd(cmd string) {
+    unsafe {
+        st := gui_state()
+        $n := cmd.len
+        if n > 63 { n = 63 }
+        for i in 0:n {
+            pending_cmd[i] = u8(cmd[i])
+        }
+        (*st).pending_len = n
+    }
+}
+
+pub fn gui_poll_command(out *raw u8, max_len int) int {
+    unsafe {
+        st := gui_state()
+        if (*st).ready == 0 || (*st).pending_len <= 0 {
+            << 0
+        }
+        $n := (*st).pending_len
+        if n > max_len { n = max_len }
+        for i in 0:n {
+            *(((out as usize) + usize(i)) as *raw u8) = pending_cmd[i]
+        }
+        (*st).pending_len = 0
+        << n
+    }
+}
+
+fn classify_term_row(row int) u8 {
+    unsafe {
+        base := row * TERM_COLS
+        c0 := term_chars[base]
+        c1 := term_chars[base + 1]
+        c2 := term_chars[base + 2]
+        if c0 == u8(91) { // '['
+            if c1 == u8(80) && c2 == u8(65) { << u8(1) } // [PA -> [PASS]
+            if c1 == u8(83) && c2 == u8(69) { << u8(1) } // [SE -> [SELFTEST]
+            if c1 == u8(70) && c2 == u8(65) { << u8(2) } // [FA -> [FAIL]
+            if c1 == u8(75) && c2 == u8(69) { << u8(2) } // [KE -> [KERNEL
+            if c1 == u8(85) && c2 == u8(83) { << u8(3) } // [US -> [USER
+            if c1 == u8(82) && c2 == u8(73) { << u8(3) } // [RI -> [RING3
+            if c1 == u8(69) && c2 == u8(76) { << u8(3) } // [EL -> [ELF]
+            if c1 == u8(80) && c2 == u8(70) { << u8(3) } // [PF -> [PF]
+            if c1 == u8(66) && c2 == u8(79) { << u8(4) } // [BO -> [BOOT]
+        }
+        if c0 == u8(120) && c1 == u8(117) && c2 == u8(45) { // xu-os>
+            << u8(5)
+        }
+    }
+    << u8(0)
+}
+
+fn term_scroll_up() {
+    unsafe {
+        $r := 0
+        while r < TERM_ROWS - 1 {
+            dst := ((($&term_chars[0]) as *raw u8) as usize) + usize(r * TERM_COLS)
+            src := ((($&term_chars[0]) as *raw u8) as usize) + usize((r + 1) * TERM_COLS)
+            mem.memcpy(dst as *raw u8, src as *raw u8, TERM_COLS)
+            term_row_tag[r] = term_row_tag[r + 1]
+            r += 1
+        }
+        last := ((($&term_chars[0]) as *raw u8) as usize) + usize((TERM_ROWS - 1) * TERM_COLS)
+        mem.memset(last as *raw u8, u8(32), TERM_COLS)
+        term_row_tag[TERM_ROWS - 1] = u8(0)
+    }
+}
+
+pub fn gui_term_clear() {
+    unsafe {
+        flags := arch.irq_save()
+        mem.memset(($&term_chars[0]) as *raw u8, u8(32), TERM_CELLS)
+        mem.memset(($&term_row_tag[0]) as *raw u8, u8(0), TERM_ROWS)
+        st := gui_state()
+        (*st).term_row = 0
+        (*st).term_col = 0
+        (*st).dirty = 1
+        (*st).force_draw = 1
+        arch.irq_restore(flags)
+    }
+}
+
+pub fn gui_term_putc(c u8) {
+    unsafe {
+        flags := arch.irq_save()
+        st := gui_state()
+        if (*st).ready == 0 {
+            arch.irq_restore(flags)
+            <<
+        }
+        if c == u8(13) {
+            (*st).term_col = 0
+            arch.irq_restore(flags)
+            <<
+        }
+        if c == u8(10) {
+            r := (*st).term_row
+            term_row_tag[r] = classify_term_row(r)
+            (*st).term_col = 0
+            if r + 1 < TERM_ROWS {
+                (*st).term_row = r + 1
+            } else {
+                term_scroll_up()
+            }
+            (*st).dirty = 1
+            arch.irq_restore(flags)
+            <<
+        }
+        if c == u8(8) {
+            if (*st).term_col > 0 {
+                (*st).term_col -= 1
+                idx := (*st).term_row * TERM_COLS + (*st).term_col
+                term_chars[idx] = u8(32)
+                (*st).dirty = 1
+            }
+            arch.irq_restore(flags)
+            <<
+        }
+        if c >= u8(32) && c < u8(127) {
+            $r := (*st).term_row
+            $col := (*st).term_col
+            if col >= TERM_COLS {
+                term_row_tag[r] = classify_term_row(r)
+                col = 0
+                if r + 1 < TERM_ROWS {
+                    r += 1
+                } else {
+                    term_scroll_up()
+                }
+                (*st).term_row = r
+            }
+            term_chars[r * TERM_COLS + col] = c
+            (*st).term_col = col + 1
+            term_row_tag[r] = classify_term_row(r)
+            (*st).dirty = 1
+        }
+        arch.irq_restore(flags)
+    }
+}
+
+pub fn gui_force_redraw() {
+    unsafe {
+        st := gui_state()
+        if (*st).ready != 0 {
+            (*st).dirty = 1
+            (*st).force_draw = 1
+        }
+    }
+}
+
+pub fn gui_init() {
+    if !fb_is_ready() {
+        <<
+    }
+    unsafe {
+        mem.memset((($&g_gui) as *raw GuiState) as *raw u8, u8(0), sizeof(GuiState))
+        mem.memset(($&term_chars[0]) as *raw u8, u8(32), TERM_CELLS)
+        mem.memset(($&term_row_tag[0]) as *raw u8, u8(0), TERM_ROWS)
+        mem.memset(($&pending_cmd[0]) as *raw u8, u8(0), 64)
+
+        st := gui_state()
+        (*st).ready = 1
+        (*st).dirty = 1
+        (*st).force_draw = 1
+        (*st).drag_win = -1
+        (*st).selected_file = 0
+        g_gui.win_order[0] = 1
+        g_gui.win_order[1] = 2
+        g_gui.win_order[2] = 0
+
+        // Window 0: Xu Terminal
+        g_gui.wins[0] = GuiWindow{x: 18, y: 44, w: 620, h: 680}
+        // Window 1: System Monitor
+        g_gui.wins[1] = GuiWindow{x: 654, y: 44, w: 608, h: 336}
+        // Window 2: XuFS Explorer
+        g_gui.wins[2] = GuiWindow{x: 654, y: 394, w: 608, h: 330}
+    }
+    gui_render()
+}
+
+fn tag_to_color(tag u8) u32 {
+    if tag == u8(1) { << u32(COL_GREEN) }
+    if tag == u8(2) { << u32(COL_RED) }
+    if tag == u8(3) { << u32(COL_CYAN) }
+    if tag == u8(4) { << u32(COL_AMBER) }
+    if tag == u8(5) { << u32(COL_INDIGO) }
+    << u32(COL_TEXT)
+}
+
+fn draw_window_frame(wid int, title string, active bool) {
+    unsafe {
+        st := gui_state()
+        wx := (*st).wins[wid].x
+        wy := (*st).wins[wid].y
+        ww := (*st).wins[wid].w
+        wh := (*st).wins[wid].h
+
+        // Subtle drop shadow
+        fb_fill_rect(wx + 4, wy + 4, ww, wh, u32(0x070B14))
+        // Window body
+        fb_fill_rect(wx, wy, ww, wh, u32(COL_WIN_BG))
+        // Title bar
+        $hdr_col := u32(COL_WIN_HDR)
+        $brd_col := u32(COL_BORDER)
+        if active {
+            hdr_col = u32(COL_WIN_ACT)
+            brd_col = u32(COL_BORDER_HI)
+        }
+        fb_fill_rect(wx + 1, wy + 1, ww - 2, TITLE_H, hdr_col)
+        fb_fill_rect(wx + 1, wy + TITLE_H, ww - 2, 1, brd_col)
+        fb_draw_rect(wx, wy, ww, wh, brd_col)
+
+        // Window traffic-light dots
+        fb_fill_rect(wx + 10, wy + 9, 8, 8, u32(COL_RED))
+        fb_fill_rect(wx + 22, wy + 9, 8, 8, u32(COL_AMBER))
+        fb_fill_rect(wx + 34, wy + 9, 8, 8, u32(COL_GREEN))
+
+        fb_draw_str_ref(wx + 52, wy + 10, &title, u32(COL_TEXT))
+    }
+}
+
+fn render_terminal_win(wid int, active bool) {
+    draw_window_frame(wid, "Xu Terminal (UART + PS/2 Keyboard)", active)
+    unsafe {
+        st := gui_state()
+        wx := (*st).wins[wid].x
+        wy := (*st).wins[wid].y
+        ww := (*st).wins[wid].w
+        wh := (*st).wins[wid].h
+
+        tx := wx + 14
+        ty := wy + TITLE_H + 10
+        $r := 0
+        while r < TERM_ROWS {
+            row_y := ty + r * 17
+            if row_y + 10 < wy + wh - 24 {
+                fg := tag_to_color(term_row_tag[r])
+                $col := 0
+                while col < TERM_COLS {
+                    ch := term_chars[r * TERM_COLS + col]
+                    if ch != u8(32) && ch != u8(0) {
+                        fb_draw_char(tx + col * 8, row_y, ch, fg, u32(0), true)
+                    }
+                    col += 1
+                }
+            }
+            r += 1
+        }
+
+        // Cursor block
+        cr := (*st).term_row
+        $cc := (*st).term_col
+        if cc >= TERM_COLS { cc = TERM_COLS - 1 }
+        cx := tx + cc * 8
+        cy := ty + cr * 17
+        if cy + 10 < wy + wh - 24 {
+            fb_fill_rect(cx, cy, 7, 10, u32(COL_INDIGO))
+        }
+
+        fb_fill_rect(wx + 1, wy + wh - 22, ww - 2, 1, u32(COL_BORDER))
+        fb_draw_str(wx + 12, wy + wh - 15, "Tip: Click window & type commands (help, selftest, elftest, pftest)", u32(COL_MUTED))
+    }
+}
+
+fn draw_progress_bar(x int, y int, w int, h int, used int, total int, fill_col u32) {
+    fb_fill_rect(x, y, w, h, u32(COL_BAR_BG))
+    fb_draw_rect(x, y, w, h, u32(COL_BORDER))
+    if total > 0 && used > 0 {
+        $fw := (used * (w - 2)) / total
+        if fw < 2 { fw = 2 }
+        if fw > w - 2 { fw = w - 2 }
+        fb_fill_rect(x + 1, y + 1, fw, h - 2, fill_col)
+    }
+}
+
+fn render_sysmon_win(wid int, active bool) {
+    draw_window_frame(wid, "System Monitor (PMM / VMM / Heap / Sched)", active)
+    unsafe {
+        st := gui_state()
+        wx := (*st).wins[wid].x
+        wy := (*st).wins[wid].y
+        ps := pmm_state()
+        vs := vmm_state()
+        hs := heap_state()
+        ss := sched_state()
+        ds := demo_state()
+
+        px := wx + 14
+        $cy := wy + TITLE_H + 12
+
+        // PMM usage
+        used_k := (*ps).used_frames * 4
+        fb_draw_str(px, cy, "PMM Physical RAM:", u32(COL_MUTED))
+        fb_draw_dec(px + 152, cy, used_k / 1024, u32(COL_TEXT))
+        fb_draw_str(px + 184, cy, "/128 MiB", u32(COL_MUTED))
+        draw_progress_bar(px, cy + 13, 336, 12, (*ps).used_frames, (*ps).total_frames, u32(COL_CYAN))
+        cy += 34
+
+        // Heap usage
+        fb_draw_str(px, cy, "Kernel Heap (1 MiB):", u32(COL_MUTED))
+        fb_draw_dec(px + 176, cy, int((*hs).bytes_used), u32(COL_TEXT))
+        fb_draw_str(px + 232, cy, "bytes", u32(COL_MUTED))
+        draw_progress_bar(px, cy + 13, 336, 12, int((*hs).bytes_used), int((*hs).size), u32(COL_GREEN))
+        cy += 36
+
+        // VMM & CPU info
+        fb_draw_str(px, cy, "CR3:", u32(COL_MUTED))
+        fb_draw_hex(px + 40, cy, (*vs).kernel_pml4, u32(COL_INDIGO))
+        fb_draw_str(px + 168, cy, "NXE:", u32(COL_MUTED))
+        if (*vs).nx_enabled != 0 {
+            fb_draw_str(px + 208, cy, "ON", u32(COL_GREEN))
+        } else {
+            fb_draw_str(px + 208, cy, "OFF", u32(COL_RED))
+        }
+        fb_draw_str(px + 244, cy, "PF:", u32(COL_MUTED))
+        fb_draw_dec(px + 276, cy, int((*vs).demand_faults), u32(COL_CYAN))
+        cy += 18
+
+        fb_draw_str(px, cy, "Switches:", u32(COL_MUTED))
+        fb_draw_dec(px + 80, cy, int((*ss).total_switches), u32(COL_TEXT))
+        fb_draw_str(px + 150, cy, "Shared:", u32(COL_MUTED))
+        fb_draw_dec(px + 214, cy, int((*ds).shared_counter), u32(COL_AMBER))
+        cy += 22
+
+        fb_fill_rect(wx + 10, cy - 4, 346, 1, u32(COL_BORDER))
+        fb_draw_str(px, cy + 4, "TID  STATE    TICKS    NAME", u32(COL_INDIGO))
+        cy += 18
+
+        $i := 0
+        $shown := 0
+        while i < 16 && shown < 7 {
+            t := tcb_at(i)
+            if (*t).state != 0 {
+                fb_draw_dec(px, cy, (*t).tid, u32(COL_TEXT))
+                if (*t).state == 2 {
+                    fb_draw_str(px + 40, cy, "RUNNING", u32(COL_GREEN))
+                } else if (*t).state == 1 {
+                    fb_draw_str(px + 40, cy, "READY  ", u32(COL_CYAN))
+                } else if (*t).state == 3 {
+                    fb_draw_str(px + 40, cy, "SLEEP  ", u32(COL_AMBER))
+                } else {
+                    fb_draw_str(px + 40, cy, "DEAD   ", u32(COL_RED))
+                }
+                fb_draw_dec(px + 112, cy, int((*t).ticks), u32(COL_MUTED))
+                fb_draw_buf(px + 184, cy, tcb_name_ptr(i), (*t).name_len, u32(COL_TEXT))
+                cy += 16
+                shown += 1
+            }
+            i += 1
+        }
+    }
+}
+
+fn xufs_name_eq(buf *raw u8, nlen int, s string) bool {
+    if nlen != s.len { << false }
+    unsafe {
+        for i in 0:nlen {
+            if int(*(((buf as usize) + usize(i)) as *raw u8)) != (s[i] & 255) {
+                << false
+            }
+        }
+    }
+    << true
+}
+
+fn render_xufs_win(wid int, active bool) {
+    draw_window_frame(wid, "XuFS Explorer (VirtIO-Blk PCI)", active)
+    unsafe {
+        st := gui_state()
+        wx := (*st).wins[wid].x
+        wy := (*st).wins[wid].y
+        ww := (*st).wins[wid].w
+        px := wx + 14
+        fb_draw_str(px, wy + TITLE_H + 10, "Click a file row to inspect or launch:", u32(COL_MUTED))
+        fb_draw_str(px, wy + TITLE_H + 26, "NAME                      SIZE      ACTION", u32(COL_INDIGO))
+
+        $sz := u32(0)
+        $secs := u32(0)
+        $fl := u32(0)
+        $row := 0
+        $i := 0
+        nbuf := ($&xufs_name_buf[0]) as *raw u8
+        while i < 24 && row < 9 {
+            if fs_inode_summary(i, (&sz) as *raw u32, (&secs) as *raw u32, (&fl) as *raw u32, nbuf, 40) {
+                ry := wy + TITLE_H + 46 + row * 24
+                if row == (*st).selected_file {
+                    fb_fill_rect(wx + 8, ry - 4, ww - 16, 20, u32(0x1E293B))
+                    fb_draw_rect(wx + 8, ry - 4, ww - 16, 20, u32(COL_BORDER_HI))
+                }
+                $nlen := 0
+                while nlen < 39 && xufs_name_buf[nlen] != u8(0) {
+                    nlen += 1
+                }
+                fb_draw_buf(px, ry + 2, nbuf, nlen, u32(COL_TEXT))
+                fb_draw_dec(px + 216, ry + 2, int(sz), u32(COL_MUTED))
+                if xufs_name_eq(nbuf, nlen, "/bin/desktop_linux") || xufs_name_eq(nbuf, nlen, "/bin/desktop_macos") {
+                    fb_draw_str(px + 308, ry + 2, "[Launch UI]", u32(COL_GREEN))
+                } else if xufs_name_eq(nbuf, nlen, "/bin/linux_app") {
+                    fb_draw_str(px + 308, ry + 2, "Linux ELF64 [Run]", u32(COL_CYAN))
+                } else if xufs_name_eq(nbuf, nlen, "/bin/macos_app") {
+                    fb_draw_str(px + 308, ry + 2, "macOS Mach-O [Run]", u32(COL_CYAN))
+                } else if xufs_name_eq(nbuf, nlen, "/bin/hello.elf") {
+                    fb_draw_str(px + 308, ry + 2, "ELF64 [Run]", u32(COL_CYAN))
+                } else if xufs_name_eq(nbuf, nlen, "/bin/fault.elf") {
+                    fb_draw_str(px + 308, ry + 2, "ELF64 [#PF Test]", u32(COL_AMBER))
+                } else if xufs_name_eq(nbuf, nlen, "/etc/font.ttf") {
+                    fb_draw_str(px + 308, ry + 2, "TrueType Font", u32(COL_MUTED))
+                } else if fl == u32(2) {
+                    fb_draw_str(px + 308, ry + 2, "BIN [Inspect]", u32(COL_CYAN))
+                } else {
+                    fb_draw_str(px + 308, ry + 2, "TEXT [View]", u32(COL_GREEN))
+                }
+                row += 1
+            }
+            i += 1
+        }
+        fb_draw_str(px, wy + (*st).wins[wid].h - 18, "Superblock: XUFS0010 (32768 sectors / 16 MiB)", u32(COL_MUTED))
+    }
+}
+
+fn dock_btn_label(idx int) string {
+    if idx == 0 { << "Selftest" }
+    if idx == 1 { << "UI Linux" }
+    if idx == 2 { << "UI macOS" }
+    if idx == 3 { << "Linux App" }
+    if idx == 4 { << "macOS App" }
+    if idx == 5 { << "ELF Ring3" }
+    if idx == 6 { << "#PF Test" }
+    << "Clear"
+}
+
+fn draw_cursor(mx int, my int) {
+    unsafe {
+        $r := 0
+        while r < 16 {
+            $c := 0
+            while c < 12 {
+                px := cursor_bmp[r * 12 + c]
+                if px == u8(1) {
+                    fb_put_pixel(mx + c, my + r, u32(0x020617))
+                } else if px == u8(2) {
+                    fb_put_pixel(mx + c, my + r, u32(0xFFFFFF))
+                }
+                c += 1
+            }
+            r += 1
+        }
+    }
+}
+
+pub fn gui_render() {
+    if !fb_is_ready() {
+        <<
+    }
+    mx := mouse_get_x()
+    my := mouse_get_y()
+
+    // 1. Desktop gradient background
+    fb_fill_gradient_v(0, TOPBAR_H, FB_WIDTH, FB_HEIGHT - TOPBAR_H, u32(COL_BG_TOP), u32(COL_BG_BOT))
+
+    // 2. Top status bar
+    fb_fill_rect(0, 0, FB_WIDTH, TOPBAR_H, u32(COL_TOPBAR))
+    fb_fill_rect(0, TOPBAR_H - 1, FB_WIDTH, 1, u32(COL_TOP_LINE))
+    fb_draw_str(14, 12, "Xu OS v0.14.2  |  x86_64 Long Mode", u32(COL_TEXT))
+
+    ticks := int(trap_ticks())
+    fb_draw_str(380, 12, "Uptime:", u32(COL_MUTED))
+    fb_draw_dec(444, 12, ticks / 100, u32(COL_GREEN))
+    fb_draw_str(476, 12, "s", u32(COL_MUTED))
+
+    free_mib := (pmm_free_frames() * 4) / 1024
+    fb_draw_str(540, 12, "Free RAM:", u32(COL_MUTED))
+    fb_draw_dec(620, 12, free_mib, u32(COL_CYAN))
+    fb_draw_str(656, 12, "MiB", u32(COL_MUTED))
+
+    // Poweroff button (x=1184..1268, y=4..28)
+    $pwr_col := u32(COL_BTN_RED)
+    if mx >= 1184 && mx < 1268 && my >= 4 && my < 28 {
+        pwr_col = u32(COL_BTN_RED_H)
+    }
+    fb_fill_rect(1184, 4, 84, 24, pwr_col)
+    fb_draw_rect(1184, 4, 84, 24, u32(COL_RED))
+    fb_draw_str(1194, 12, "Poweroff", u32(COL_TEXT))
+
+    // 3. Windows back-to-front
+    unsafe {
+        st := gui_state()
+        $oi := 0
+        while oi < 3 {
+            wid := (*st).win_order[oi]
+            active := oi == 2
+            if wid == 0 {
+                render_terminal_win(wid, active)
+            } else if wid == 1 {
+                render_sysmon_win(wid, active)
+            } else {
+                render_xufs_win(wid, active)
+            }
+            oi += 1
+        }
+    }
+
+    // 4. Bottom Dock (8 centered pill buttons: start x=208, each w=100, gap=8)
+    fb_fill_rect(196, DOCK_Y, 888, DOCK_H, u32(COL_DOCK_BG))
+    fb_draw_rect(196, DOCK_Y, 888, DOCK_H, u32(COL_TOP_LINE))
+    $bi := 0
+    while bi < NUM_DOCK_BTNS {
+        bx := 208 + bi * 108
+        by := DOCK_Y + 8
+        bw := 100
+        bh := 32
+        $bcol := u32(COL_BTN_BG)
+        $bbrd := u32(COL_BORDER)
+        if mx >= bx && mx < bx + bw && my >= by && my < by + bh {
+            bcol = u32(COL_BTN_HOV)
+            bbrd = u32(COL_BORDER_HI)
+        }
+        fb_fill_rect(bx, by, bw, bh, bcol)
+        fb_draw_rect(bx, by, bw, bh, bbrd)
+        lbl := dock_btn_label(bi)
+        lx := bx + (bw - lbl.len * 8) / 2
+        fb_draw_str_ref(lx, by + 12, &lbl, u32(COL_TEXT))
+        bi += 1
+    }
+
+    // 5. Mouse cursor
+    draw_cursor(mx, my)
+
+    fb_present()
+}
+
+fn raise_window(st *raw GuiState, wid int) {
+    unsafe {
+        if g_gui.win_order[2] == wid { << }
+        if g_gui.win_order[1] == wid {
+            g_gui.win_order[1] = g_gui.win_order[2]
+            g_gui.win_order[2] = wid
+        } else if g_gui.win_order[0] == wid {
+            g_gui.win_order[0] = g_gui.win_order[1]
+            g_gui.win_order[1] = g_gui.win_order[2]
+            g_gui.win_order[2] = wid
+        }
+    }
+}
+
+fn handle_click(cx int, cy int) {
+    // 1. Top bar Poweroff button
+    if cx >= 1184 && cx < 1268 && cy >= 4 && cy < 28 {
+        gui_queue_cmd("poweroff")
+        <<
+    }
+
+    // 2. Bottom dock buttons
+    if cy >= DOCK_Y + 8 && cy < DOCK_Y + 40 {
+        $bi := 0
+        while bi < NUM_DOCK_BTNS {
+            bx := 208 + bi * 108
+            if cx >= bx && cx < bx + 100 {
+                if bi == 0 { gui_queue_cmd("selftest") }
+                else if bi == 1 { gui_queue_cmd("ui") }
+                else if bi == 2 { gui_queue_cmd("uimac") }
+                else if bi == 3 { gui_queue_cmd("linuxtest") }
+                else if bi == 4 { gui_queue_cmd("mactest") }
+                else if bi == 5 { gui_queue_cmd("elftest") }
+                else if bi == 6 { gui_queue_cmd("pftest") }
+                else { gui_term_clear() }
+                <<
+            }
+            bi += 1
+        }
+    }
+
+    // 3. Windows front-to-back
+    unsafe {
+        st := gui_state()
+        $oi := 2
+        while oi >= 0 {
+            wid := (*st).win_order[oi]
+            wx := (*st).wins[wid].x
+            wy := (*st).wins[wid].y
+            ww := (*st).wins[wid].w
+            wh := (*st).wins[wid].h
+            if cx >= wx && cx < wx + ww && cy >= wy && cy < wy + wh {
+                raise_window(st, wid)
+                (*st).dirty = 1
+                if cy < wy + TITLE_H {
+                    (*st).drag_win = wid
+                    (*st).drag_off_x = cx - wx
+                    (*st).drag_off_y = cy - wy
+                } else if wid == 2 {
+                    // XuFS Explorer row click: dispatch command based on actual inode path
+                    if cy >= wy + TITLE_H + 42 {
+                        row := (cy - (wy + TITLE_H + 42)) / 24
+                        if row >= 0 && row < 9 {
+                            (*st).selected_file = row
+                            $sz := u32(0)
+                            $secs := u32(0)
+                            $fl := u32(0)
+                            $vis := 0
+                            $idx := 0
+                            nbuf := ($&xufs_name_buf[0]) as *raw u8
+                            while idx < 24 {
+                                if fs_inode_summary(idx, (&sz) as *raw u32, (&secs) as *raw u32, (&fl) as *raw u32, nbuf, 40) {
+                                    if vis == row {
+                                        $nlen := 0
+                                        while nlen < 39 && xufs_name_buf[nlen] != u8(0) { nlen += 1 }
+                                        if xufs_name_eq(nbuf, nlen, "/etc/motd") { gui_queue_cmd("cat") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/hello.elf") { gui_queue_cmd("elftest") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/fault.elf") { gui_queue_cmd("pftest") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/linux_app") { gui_queue_cmd("linuxtest") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/macos_app") { gui_queue_cmd("mactest") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/desktop_linux") { gui_queue_cmd("ui") }
+                                        else if xufs_name_eq(nbuf, nlen, "/bin/desktop_macos") { gui_queue_cmd("uimac") }
+                                        else if xufs_name_eq(nbuf, nlen, "/etc/font.ttf") { gui_queue_cmd("info") }
+                                        else { gui_queue_cmd("fstest") }
+                                        <-
+                                    }
+                                    vis += 1
+                                }
+                                idx += 1
+                            }
+                        }
+                    }
+                }
+                <<
+            }
+            oi -= 1
+        }
+    }
+}
+
+pub fn gui_tick() {
+    unsafe {
+        st := gui_state()
+        if (*st).ready == 0 { << }
+
+        $cx := 0
+        $cy := 0
+        if mouse_consume_click((&cx) as *raw int, (&cy) as *raw int) {
+            handle_click(cx, cy)
+            (*st).dirty = 1
+        }
+
+        btns := mouse_get_buttons()
+        if (btns & 1) != 0 && (*st).drag_win >= 0 {
+            wid := (*st).drag_win
+            mx := mouse_get_x()
+            my := mouse_get_y()
+            $nx := mx - (*st).drag_off_x
+            $ny := my - (*st).drag_off_y
+            ww := (*st).wins[wid].w
+            wh := (*st).wins[wid].h
+            if nx < 0 { nx = 0 }
+            if nx > FB_WIDTH - ww { nx = FB_WIDTH - ww }
+            if ny < TOPBAR_H + 2 { ny = TOPBAR_H + 2 }
+            if ny > DOCK_Y - wh - 4 { ny = DOCK_Y - wh - 4 }
+            if nx != g_gui.wins[wid].x || ny != g_gui.wins[wid].y {
+                g_gui.wins[wid].x = nx
+                g_gui.wins[wid].y = ny
+                (*st).dirty = 1
+            }
+        } else if (btns & 1) == 0 {
+            (*st).drag_win = -1
+        }
+
+        if mouse_take_dirty() {
+            (*st).dirty = 1
+        }
+
+        now := trap_ticks()
+        elapsed := now - (*st).last_draw_tick
+        need_draw := (*st).force_draw != 0 || ((*st).dirty != 0 && elapsed >= u64(2)) || elapsed >= u64(25)
+        if need_draw {
+            (*st).dirty = 0
+            (*st).force_draw = 0
+            (*st).last_draw_tick = now
+            (*st).frame_count += u64(1)
+            gui_render()
+        }
+    }
+}

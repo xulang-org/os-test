@@ -1,0 +1,1040 @@
+@main
+
+#errors
+#math
+#strings
+#ui/font
+#ui/internal/codec
+#unicode/utf8
+
+pub const SW_WIDTH = 1280
+pub const SW_HEIGHT = 800
+pub const SW_BYTES = 4096000
+
+struct SwState {
+    tx f64
+    ty f64
+    sx f64
+    sy f64
+    cx0 int
+    cy0 int
+    cx1 int
+    cy1 int
+    fill_rgba int
+    stroke_rgba int
+    stroke_w f64
+}
+
+struct SwEdge {
+    x0 f64
+    y0 f64
+    x1 f64
+    y1 f64
+    dir int
+}
+
+pub struct SwRaster {
+    pub width int
+    pub height int
+    pub pixels string
+    saved_bg []u32
+    cursor_saved bool
+    cursor_x int
+    cursor_y int
+}
+
+pub fn sw_raster_new(w int, h int) SwRaster {
+    zero_ch := " "
+    pixels := strings.repeat(&zero_ch, w * h * 4)
+    $sbg := []u32{}
+    for i in 0:400 {
+        sbg.push(u32(0))
+    }
+    << SwRaster{
+        width: w,
+        height: h,
+        pixels: pixels,
+        saved_bg: sbg,
+        cursor_saved: false,
+        cursor_x: 0,
+        cursor_y: 0
+    }
+}
+
+fn (r $&SwRaster) pix_ptr() *raw u32 {
+    unsafe {
+        desc := ($&r.pixels) as *raw u64
+        << (*desc) as *raw u32
+    }
+}
+
+fn default_state(w int, h int) SwState {
+    << SwState{
+        tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0,
+        cx0: 0, cy0: 0, cx1: w, cy1: h,
+        fill_rgba: -1, stroke_rgba: -1, stroke_w: 1.0
+    }
+}
+
+fn clone_state(s &SwState) SwState {
+    << SwState{
+        tx: s.tx, ty: s.ty, sx: s.sx, sy: s.sy,
+        cx0: s.cx0, cy0: s.cy0, cx1: s.cx1, cy1: s.cy1,
+        fill_rgba: s.fill_rgba, stroke_rgba: s.stroke_rgba, stroke_w: s.stroke_w
+    }
+}
+
+fn clamp_i(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn blend_px(base *raw u32, idx int, sr int, sg int, sb int, a int) {
+    if a <= 0 { << }
+    unsafe {
+        p := ((base as usize) + usize(idx * 4)) as *raw u32
+        if a >= 255 {
+            *p = u32(0xFF000000) | u32(sr << 16) | u32(sg << 8) | u32(sb)
+            <<
+        }
+        dst := int(*p)
+        dr := (dst >> 16) & 255
+        dg := (dst >> 8) & 255
+        db := dst & 255
+        ia := 255 - a
+        or_c := (sr * a + dr * ia + 127) / 255
+        og_c := (sg * a + dg * ia + 127) / 255
+        ob_c := (sb * a + db * ia + 127) / 255
+        *p = u32(0xFF000000) | u32(or_c << 16) | u32(og_c << 8) | u32(ob_c)
+    }
+}
+
+fn fill_rect_raw(base *raw u32, w int, x0 int, y0 int, x1 int, y1 int, rgba int, st &SwState) {
+    a := rgba & 255
+    if a <= 0 { << }
+    ax0 := clamp_i(x0, st.cx0, st.cx1)
+    ay0 := clamp_i(y0, st.cy0, st.cy1)
+    ax1 := clamp_i(x1, st.cx0, st.cx1)
+    ay1 := clamp_i(y1, st.cy0, st.cy1)
+    if ax0 >= ax1 || ay0 >= ay1 { << }
+
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+    if a >= 255 {
+        packed := u32(0xFF000000) | u32(sr << 16) | u32(sg << 8) | u32(sb)
+        unsafe {
+            $y := ay0
+            while y < ay1 {
+                row := y * w
+                $x := ax0
+                while x < ax1 {
+                    p := ((base as usize) + usize((row + x) * 4)) as *raw u32
+                    *p = packed
+                    x += 1
+                }
+                y += 1
+            }
+        }
+        <<
+    }
+    $y := ay0
+    while y < ay1 {
+        row := y * w
+        $x := ax0
+        while x < ax1 {
+            blend_px(base, row + x, sr, sg, sb, a)
+            x += 1
+        }
+        y += 1
+    }
+}
+
+fn fill_circle_raw(base *raw u32, w int, cx f64, cy f64, rad f64, rgba int, st &SwState) {
+    a := rgba & 255
+    if a <= 0 || rad <= 0.0 { << }
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+    x0 := clamp_i(int(math.floor(cx - rad - 1.5)), st.cx0, st.cx1)
+    y0 := clamp_i(int(math.floor(cy - rad - 1.5)), st.cy0, st.cy1)
+    x1 := clamp_i(int(math.ceil(cx + rad + 1.5)), st.cx0, st.cx1)
+    y1 := clamp_i(int(math.ceil(cy + rad + 1.5)), st.cy0, st.cy1)
+    r_in := math.max(0.0, rad - 0.5)
+    r_out := rad + 0.5
+    r_out2 := r_out * r_out
+    $y := y0
+    while y < y1 {
+        dy := (f64(y) + 0.5) - cy
+        dy2 := dy * dy
+        if dy2 <= r_out2 {
+            dx_max := math.sqrt(r_out2 - dy2)
+            lx := clamp_i(int(math.floor(cx - dx_max)), x0, x1)
+            rx := clamp_i(int(math.ceil(cx + dx_max)), x0, x1)
+            row := y * w
+            $x := lx
+            while x < rx {
+                dx := (f64(x) + 0.5) - cx
+                d := math.sqrt(dx * dx + dy2)
+                if d <= r_in {
+                    blend_px(base, row + x, sr, sg, sb, a)
+                } else if d < r_out {
+                    cov := r_out - d
+                    eff_a := int(math.floor(f64(a) * cov + 0.5))
+                    if eff_a > 0 {
+                        blend_px(base, row + x, sr, sg, sb, eff_a)
+                    }
+                }
+                x += 1
+            }
+        }
+        y += 1
+    }
+}
+
+fn fill_ellipse_raw(base *raw u32, w int, x f64, y f64, ew f64, eh f64, rgba int, st &SwState) {
+    a := rgba & 255
+    if a <= 0 || ew <= 0.0 || eh <= 0.0 { << }
+    rx := ew * 0.5
+    ry := eh * 0.5
+    cx := x + rx
+    cy := y + ry
+    min_r := math.min(rx, ry)
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+    x0 := clamp_i(int(math.floor(x - 1.0)), st.cx0, st.cx1)
+    y0 := clamp_i(int(math.floor(y - 1.0)), st.cy0, st.cy1)
+    x1 := clamp_i(int(math.ceil(x + ew + 1.0)), st.cx0, st.cx1)
+    y1 := clamp_i(int(math.ceil(y + eh + 1.0)), st.cy0, st.cy1)
+    $py := y0
+    while py < y1 {
+        ny := ((f64(py) + 0.5) - cy) / ry
+        ny2 := ny * ny
+        if ny2 <= 1.25 {
+            row := py * w
+            $px := x0
+            while px < x1 {
+                nx := ((f64(px) + 0.5) - cx) / rx
+                nd := math.sqrt(nx * nx + ny2)
+                px_dist := (nd - 1.0) * min_r
+                if px_dist <= -0.5 {
+                    blend_px(base, row + px, sr, sg, sb, a)
+                } else if px_dist < 0.5 {
+                    cov := 0.5 - px_dist
+                    eff_a := int(math.floor(f64(a) * cov + 0.5))
+                    if eff_a > 0 {
+                        blend_px(base, row + px, sr, sg, sb, eff_a)
+                    }
+                }
+                px += 1
+            }
+        }
+        py += 1
+    }
+}
+
+fn draw_thick_line(base *raw u32, w int, x0 f64, y0 f64, x1 f64, y1 f64, lw f64, rgba int, st &SwState) {
+    a := rgba & 255
+    if a <= 0 { << }
+    half := math.max(0.45, lw * 0.5)
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+
+    // Crisp fast path for axis-aligned horizontal/vertical segments
+    dx := x1 - x0
+    dy := y1 - y0
+    if math.abs(dy) < 0.01 {
+        minx := math.min(x0, x1)
+        maxx := math.max(x0, x1)
+        ix0 := int(math.floor(minx + 0.5))
+        $ix1 := int(math.floor(maxx + 0.5))
+        if ix1 <= ix0 { ix1 = ix0 + 1 }
+        fy0 := y0 - half
+        fy1 := y0 + half
+        iy0 := clamp_i(int(math.floor(fy0)), st.cy0, st.cy1)
+        iy1 := clamp_i(int(math.ceil(fy1)), st.cy0, st.cy1)
+        $py := iy0
+        while py < iy1 {
+            c_top := math.max(fy0, f64(py))
+            c_bot := math.min(fy1, f64(py + 1))
+            if c_bot > c_top {
+                cov := c_bot - c_top
+                eff_a := int(math.floor(f64(a) * cov + 0.5))
+                if eff_a > 0 {
+                    blend_rgb := (sr << 24) | (sg << 16) | (sb << 8) | eff_a
+                    fill_rect_raw(base, w, ix0, py, ix1, py + 1, blend_rgb, st)
+                }
+            }
+            py += 1
+        }
+        <<
+    }
+    if math.abs(dx) < 0.01 {
+        miny := math.min(y0, y1)
+        maxy := math.max(y0, y1)
+        iy0 := int(math.floor(miny + 0.5))
+        $iy1 := int(math.floor(maxy + 0.5))
+        if iy1 <= iy0 { iy1 = iy0 + 1 }
+        fx0 := x0 - half
+        fx1 := x0 + half
+        ix0 := clamp_i(int(math.floor(fx0)), st.cx0, st.cx1)
+        ix1 := clamp_i(int(math.ceil(fx1)), st.cx0, st.cx1)
+        $px := ix0
+        while px < ix1 {
+            c_l := math.max(fx0, f64(px))
+            c_r := math.min(fx1, f64(px + 1))
+            if c_r > c_l {
+                cov := c_r - c_l
+                eff_a := int(math.floor(f64(a) * cov + 0.5))
+                if eff_a > 0 {
+                    blend_rgb := (sr << 24) | (sg << 16) | (sb << 8) | eff_a
+                    fill_rect_raw(base, w, px, iy0, px + 1, iy1, blend_rgb, st)
+                }
+            }
+            px += 1
+        }
+        <<
+    }
+
+    minx := clamp_i(int(math.floor(math.min(x0, x1) - half - 1.5)), st.cx0, st.cx1)
+    miny := clamp_i(int(math.floor(math.min(y0, y1) - half - 1.5)), st.cy0, st.cy1)
+    maxx := clamp_i(int(math.ceil(math.max(x0, x1) + half + 1.5)), st.cx0, st.cx1)
+    maxy := clamp_i(int(math.ceil(math.max(y0, y1) + half + 1.5)), st.cy0, st.cy1)
+    len2 := dx * dx + dy * dy
+    r_in := math.max(0.0, half - 0.5)
+    r_out := half + 0.5
+    r_out2 := r_out * r_out
+    $py := miny
+    while py < maxy {
+        fy := f64(py) + 0.5
+        row := py * w
+        $px := minx
+        while px < maxx {
+            fx := f64(px) + 0.5
+            $t := 0.0
+            if len2 > 0.000001 {
+                t = ((fx - x0) * dx + (fy - y0) * dy) / len2
+                if t < 0.0 { t = 0.0 }
+                if t > 1.0 { t = 1.0 }
+            }
+            cx := x0 + t * dx
+            cy := y0 + t * dy
+            ex := fx - cx
+            ey := fy - cy
+            d2 := ex * ex + ey * ey
+            if d2 <= r_out2 {
+                d := math.sqrt(d2)
+                if d <= r_in {
+                    blend_px(base, row + px, sr, sg, sb, a)
+                } else {
+                    cov := r_out - d
+                    eff_a := int(math.floor(f64(a) * cov + 0.5))
+                    if eff_a > 0 {
+                        blend_px(base, row + px, sr, sg, sb, eff_a)
+                    }
+                }
+            }
+            px += 1
+        }
+        py += 1
+    }
+}
+
+fn seg_dist2(px f64, py f64, x0 f64, y0 f64, x1 f64, y1 f64) f64 {
+    dx := x1 - x0
+    dy := y1 - y0
+    len2 := dx * dx + dy * dy
+    $t := 0.0
+    if len2 > 0.000001 {
+        t = ((px - x0) * dx + (py - y0) * dy) / len2
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+    }
+    ex := px - (x0 + t * dx)
+    ey := py - (y0 + t * dy)
+    << ex * ex + ey * ey
+}
+
+fn stroke_cluster_aa(base *raw u32, w int, xs &[]f64, ys &[]f64, start_i int, end_i int, closed bool, lw f64, rgba int, st &SwState) {
+    a := rgba & 255
+    if a <= 0 || end_i <= start_i { << }
+    half := math.max(0.45, lw * 0.5)
+    r_in := math.max(0.0, half - 0.5)
+    r_out := half + 0.5
+    r_out2 := r_out * r_out
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+
+    n := xs.len
+    if n < 2 { << }
+    $minx_f := 1000000000.0
+    $miny_f := 1000000000.0
+    $maxx_f := -1000000000.0
+    $maxy_f := -1000000000.0
+    $si := start_i
+    while si <= end_i {
+        $i0 := si
+        while i0 >= n { i0 -= n }
+        x0 := xs[i0]
+        y0 := ys[i0]
+        if x0 < minx_f { minx_f = x0 }
+        if x0 > maxx_f { maxx_f = x0 }
+        if y0 < miny_f { miny_f = y0 }
+        if y0 > maxy_f { maxy_f = y0 }
+        si += 1
+    }
+    if closed && end_i == n {
+        if xs[0] < minx_f { minx_f = xs[0] }
+        if xs[0] > maxx_f { maxx_f = xs[0] }
+        if ys[0] < miny_f { miny_f = ys[0] }
+        if ys[0] > maxy_f { maxy_f = ys[0] }
+    }
+
+    bx0 := clamp_i(int(math.floor(minx_f - half - 1.5)), st.cx0, st.cx1)
+    by0 := clamp_i(int(math.floor(miny_f - half - 1.5)), st.cy0, st.cy1)
+    bx1 := clamp_i(int(math.ceil(maxx_f + half + 1.5)), st.cx0, st.cx1)
+    by1 := clamp_i(int(math.ceil(maxy_f + half + 1.5)), st.cy0, st.cy1)
+    if bx0 >= bx1 || by0 >= by1 { << }
+
+    $py := by0
+    while py < by1 {
+        fy := f64(py) + 0.5
+        row := py * w
+        $px := bx0
+        while px < bx1 {
+            fx := f64(px) + 0.5
+            $best2 := r_out2 + 1.0
+            $k := start_i
+            while k < end_i {
+                i0 := k
+                $i1 := k + 1
+                if i1 >= n { i1 = 0 }
+                d2 := seg_dist2(fx, fy, xs[i0], ys[i0], xs[i1], ys[i1])
+                if d2 < best2 { best2 = d2 }
+                k += 1
+            }
+            if best2 <= r_out2 {
+                d := math.sqrt(best2)
+                if d <= r_in {
+                    blend_px(base, row + px, sr, sg, sb, a)
+                } else {
+                    cov := r_out - d
+                    eff_a := int(math.floor(f64(a) * cov + 0.5))
+                    if eff_a > 0 {
+                        blend_px(base, row + px, sr, sg, sb, eff_a)
+                    }
+                }
+            }
+            px += 1
+        }
+        py += 1
+    }
+}
+
+fn is_long_hv_seg(x0 f64, y0 f64, x1 f64, y1 f64) bool {
+    dx := math.abs(x1 - x0)
+    dy := math.abs(y1 - y0)
+    if dy < 0.01 && dx > 4.0 { << true }
+    if dx < 0.01 && dy > 4.0 { << true }
+    << false
+}
+
+fn stroke_polyline_aa(base *raw u32, w int, xs &[]f64, ys &[]f64, closed bool, lw f64, rgba int, st &SwState) {
+    n := xs.len
+    if n < 2 { << }
+    $seg_end := n - 1
+    if closed { seg_end = n }
+    $i := 0
+    while i < seg_end {
+        $i1 := i + 1
+        if i1 >= n { i1 = 0 }
+        if is_long_hv_seg(xs[i], ys[i], xs[i1], ys[i1]) {
+            draw_thick_line(base, w, xs[i], ys[i], xs[i1], ys[i1], lw, rgba, st)
+            i += 1
+        } else {
+            run_start := i
+            $j := i + 1
+            while j < seg_end {
+                $j1 := j + 1
+                if j1 >= n { j1 = 0 }
+                if is_long_hv_seg(xs[j], ys[j], xs[j1], ys[j1]) { <- }
+                j += 1
+            }
+            stroke_cluster_aa(base, w, xs, ys, run_start, j, closed, lw, rgba, st)
+            i = j
+        }
+    }
+}
+
+fn push_edge(edges $&[]SwEdge, x0 f64, y0 f64, x1 f64, y1 f64) {
+    if math.abs(y1 - y0) < 0.0001 { << }
+    if y0 < y1 {
+        edges.push(SwEdge{x0: x0, y0: y0, x1: x1, y1: y1, dir: 1})
+    } else {
+        edges.push(SwEdge{x0: x1, y0: y1, x1: x0, y1: y0, dir: -1})
+    }
+}
+
+fn flatten_quad_poly(x0 f64, y0 f64, cx f64, cy f64, x1 f64, y1 f64, depth int,
+                     xs $&[]f64, ys $&[]f64) {
+    _ := depth
+    for k in 1:13 {
+        t := f64(k) / 12.0
+        u := 1.0 - t
+        px := u * u * x0 + 2.0 * u * t * cx + t * t * x1
+        py := u * u * y0 + 2.0 * u * t * cy + t * t * y1
+        xs.push(px)
+        ys.push(py)
+    }
+}
+
+fn flatten_cubic_poly(x0 f64, y0 f64, c1x f64, c1y f64, c2x f64, c2y f64, x1 f64, y1 f64,
+                      depth int, xs $&[]f64, ys $&[]f64) {
+    _ := depth
+    for k in 1:13 {
+        t := f64(k) / 12.0
+        u := 1.0 - t
+        u2 := u * u
+        t2 := t * t
+        px := u2 * u * x0 + 3.0 * u2 * t * c1x + 3.0 * u * t2 * c2x + t2 * t * x1
+        py := u2 * u * y0 + 3.0 * u2 * t * c1y + 3.0 * u * t2 * c2y + t2 * t * y1
+        xs.push(px)
+        ys.push(py)
+    }
+}
+
+fn add_sub_span(cov_row $&[]int, raw_x0 f64, raw_x1 f64, st &SwState, span_lo $&int, span_hi $&int) {
+    s0 := math.max(raw_x0, f64(st.cx0))
+    s1 := math.min(raw_x1, f64(st.cx1))
+    if s1 <= s0 { << }
+    $ix0 := int(math.floor(s0))
+    $ix1 := int(math.floor(s1 - 0.000001))
+    if ix0 < st.cx0 { ix0 = st.cx0 }
+    if ix1 >= st.cx1 { ix1 = st.cx1 - 1 }
+    if ix0 > ix1 { << }
+    if ix0 < *span_lo { *span_lo = ix0 }
+    if ix1 > *span_hi { *span_hi = ix1 }
+    if ix0 == ix1 {
+        cov_row[ix0] += int(math.floor((s1 - s0) * 64.0 + 0.5))
+        <<
+    }
+    f_l := f64(ix0 + 1) - s0
+    cov_row[ix0] += int(math.floor(f_l * 64.0 + 0.5))
+    $px := ix0 + 1
+    while px < ix1 {
+        cov_row[px] += 64
+        px += 1
+    }
+    f_r := s1 - f64(ix1)
+    cov_row[ix1] += int(math.floor(f_r * 64.0 + 0.5))
+}
+
+fn fill_polygon_edges(base *raw u32, w int, edges &[]SwEdge, miny_f f64, maxy_f f64, rgba int, evenodd bool, st &SwState, cov_row $&[]int) {
+    a := rgba & 255
+    if a <= 0 || edges.len == 0 { << }
+    y0 := clamp_i(int(math.floor(miny_f)), st.cy0, st.cy1)
+    y1 := clamp_i(int(math.ceil(maxy_f)), st.cy0, st.cy1)
+    if y0 >= y1 { << }
+
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+
+    $xs := []f64{}
+    $dirs := []int{}
+    $sy := y0
+    while sy < y1 {
+        $span_lo := w
+        $span_hi := -1
+        for sub in 0:4 {
+            fy := f64(sy) + 0.125 + f64(sub) * 0.25
+            $count := 0
+            for ei in 0:edges.len {
+                e := &edges[ei]
+                if fy >= e.y0 && fy < e.y1 {
+                    t := (fy - e.y0) / (e.y1 - e.y0)
+                    ix := e.x0 + t * (e.x1 - e.x0)
+                    if count < xs.len {
+                        xs[count] = ix
+                        dirs[count] = e.dir
+                    } else {
+                        xs.push(ix)
+                        dirs.push(e.dir)
+                    }
+                    count += 1
+                }
+            }
+            $k := 1
+            while k < count {
+                kx := xs[k]
+                kd := dirs[k]
+                $j := k - 1
+                while j >= 0 && xs[j] > kx {
+                    xs[j + 1] = xs[j]
+                    dirs[j + 1] = dirs[j]
+                    j -= 1
+                }
+                xs[j + 1] = kx
+                dirs[j + 1] = kd
+                k += 1
+            }
+            if evenodd {
+                $idx := 0
+                while idx + 1 < count {
+                    add_sub_span(cov_row, xs[idx], xs[idx + 1], st, $&span_lo, $&span_hi)
+                    idx += 2
+                }
+            } else {
+                $wind := 0
+                $start_x := 0.0
+                $idx := 0
+                while idx < count {
+                    was_nz := wind != 0
+                    wind += dirs[idx]
+                    is_nz := wind != 0
+                    if !was_nz && is_nz {
+                        start_x = xs[idx]
+                    } else if was_nz && !is_nz {
+                        add_sub_span(cov_row, start_x, xs[idx], st, $&span_lo, $&span_hi)
+                    }
+                    idx += 1
+                }
+            }
+        }
+        if span_hi >= span_lo {
+            row := sy * w
+            $px := span_lo
+            while px <= span_hi {
+                $cov := cov_row[px]
+                cov_row[px] = 0
+                if cov > 0 {
+                    if cov > 256 { cov = 256 }
+                    eff_a := (cov * a + 128) >> 8
+                    if eff_a > 0 {
+                        blend_px(base, row + px, sr, sg, sb, eff_a)
+                    }
+                }
+                px += 1
+            }
+        }
+        sy += 1
+    }
+}
+
+fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov_row $&[]int) {
+    flags := codec.read_word32(payload, p)
+    rgba := codec.read_word32(payload, p + 4)
+    seg_count := codec.read_word32(payload, p + 8)
+    dashes := codec.read_word32(payload, p + 12)
+    width := codec.read_float64(payload, p + 16) or (err) { << }
+    is_stroke := (flags & 1) != 0
+    evenodd := (flags & 2) != 0
+
+    $cursor := p + 48 + dashes * 8
+    $edges := []SwEdge{}
+    $fig_xs := []f64{}
+    $fig_ys := []f64{}
+    $has_cur := false
+    $cur_x := 0.0
+    $cur_y := 0.0
+    $miny := 1000000000.0
+    $maxy := -1000000000.0
+
+    for si in 0:seg_count {
+        verb := codec.read_word32(payload, cursor)
+        cursor += 4
+        if verb == 1 {
+            // Flush previous open figure for fill/stroke
+            if fig_xs.len >= 2 {
+                if !is_stroke {
+                    for pi in 1:fig_xs.len {
+                        push_edge($&edges, fig_xs[pi - 1], fig_ys[pi - 1], fig_xs[pi], fig_ys[pi])
+                    }
+                    push_edge($&edges, fig_xs[fig_xs.len - 1], fig_ys[fig_ys.len - 1], fig_xs[0], fig_ys[0])
+                } else {
+                    stroke_polyline_aa(base, w, &fig_xs, &fig_ys, false, width * st.sx, rgba, st)
+                }
+            }
+            fig_xs = []f64{}
+            fig_ys = []f64{}
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            cursor += 16
+            fig_xs.push(nx)
+            fig_ys.push(ny)
+            cur_x = nx
+            cur_y = ny
+            has_cur = true
+            if ny < miny { miny = ny }
+            if ny > maxy { maxy = ny }
+        } else if verb == 2 && has_cur {
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            cursor += 16
+            fig_xs.push(nx)
+            fig_ys.push(ny)
+            cur_x = nx
+            cur_y = ny
+            if ny < miny { miny = ny }
+            if ny > maxy { maxy = ny }
+        } else if verb == 3 && has_cur {
+            cx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
+            cy := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) or (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) or (err) { << })
+            cursor += 32
+            flatten_quad_poly(cur_x, cur_y, cx, cy, nx, ny, 0, $&fig_xs, $&fig_ys)
+            cur_x = nx
+            cur_y = ny
+            if cy < miny { miny = cy }
+            if cy > maxy { maxy = cy }
+            if ny < miny { miny = ny }
+            if ny > maxy { maxy = ny }
+        } else if verb == 4 && has_cur {
+            c1x := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
+            c1y := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            c2x := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) or (err) { << })
+            c2y := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) or (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 32) or (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 40) or (err) { << })
+            cursor += 48
+            flatten_cubic_poly(cur_x, cur_y, c1x, c1y, c2x, c2y, nx, ny, 0, $&fig_xs, $&fig_ys)
+            cur_x = nx
+            cur_y = ny
+            if c1y < miny { miny = c1y }
+            if c1y > maxy { maxy = c1y }
+            if c2y < miny { miny = c2y }
+            if c2y > maxy { maxy = c2y }
+            if ny < miny { miny = ny }
+            if ny > maxy { maxy = ny }
+        } else if verb == 5 && has_cur {
+            if fig_xs.len >= 2 {
+                if !is_stroke {
+                    for pi in 1:fig_xs.len {
+                        push_edge($&edges, fig_xs[pi - 1], fig_ys[pi - 1], fig_xs[pi], fig_ys[pi])
+                    }
+                    push_edge($&edges, fig_xs[fig_xs.len - 1], fig_ys[fig_ys.len - 1], fig_xs[0], fig_ys[0])
+                } else {
+                    stroke_polyline_aa(base, w, &fig_xs, &fig_ys, true, width * st.sx, rgba, st)
+                }
+            }
+            fig_xs = []f64{}
+            fig_ys = []f64{}
+            has_cur = false
+        }
+    }
+    if fig_xs.len >= 2 {
+        if !is_stroke {
+            for pi in 1:fig_xs.len {
+                push_edge($&edges, fig_xs[pi - 1], fig_ys[pi - 1], fig_xs[pi], fig_ys[pi])
+            }
+            push_edge($&edges, fig_xs[fig_xs.len - 1], fig_ys[fig_ys.len - 1], fig_xs[0], fig_ys[0])
+        } else {
+            stroke_polyline_aa(base, w, &fig_xs, &fig_ys, false, width * st.sx, rgba, st)
+        }
+    }
+    if !is_stroke && edges.len >= 2 {
+        fill_polygon_edges(base, w, &edges, miny, maxy, rgba, evenodd, st, cov_row)
+    }
+}
+
+fn safe_utf8_cp(text &string, pos int) int {
+    << utf8.decode(text, pos) or (err) { << 63 }
+}
+
+fn safe_utf8_w(text &string, pos int) int {
+    << utf8.decode_width(text, pos) or (err) { << 1 }
+}
+
+fn draw_text_op_raw(base *raw u32, w int, stack &font.FontStack, atl $&font.GlyphAtlas, x f64, y f64, size f64, rgba int, text &string, st &SwState) {
+    a := rgba & 255
+    if a <= 0 || text.len == 0 || size <= 0.0 { << }
+    sr := (rgba >> 24) & 255
+    sg := (rgba >> 16) & 255
+    sb := (rgba >> 8) & 255
+
+    scaled_sz := size * st.sy
+    lm := stack.line_metrics(scaled_sz) or (err) { << }
+    $pen_x := st.tx + st.sx * x
+    baseline_y := st.ty + st.sy * y + lm.ascent
+
+    $pos := 0
+    while pos < text.len {
+        cp := safe_utf8_cp(text, pos)
+        $step := safe_utf8_w(text, pos)
+        if step < 1 { step = 1 }
+        if cp == 9 {
+            pen_x += scaled_sz * 1.6
+            pos += step
+            ->
+        }
+        if cp < 32 {
+            pos += step
+            ->
+        }
+        entry := atl.get_codepoint(stack, cp, scaled_sz) or (err) {
+            pos += step
+            ->
+        }
+        if entry.has_ink {
+            gx0 := int(math.floor(pen_x + 0.5)) + entry.offset_x
+            gy0 := int(math.floor(baseline_y + 0.5)) + entry.offset_y
+            $gy := 0
+            while gy < entry.h {
+                py := gy0 + gy
+                if py >= st.cy0 && py < st.cy1 {
+                    row := py * w
+                    $gx := 0
+                    while gx < entry.w {
+                        px := gx0 + gx
+                        if px >= st.cx0 && px < st.cx1 {
+                            cov := atl.sample_alpha(entry.x + gx, entry.y + gy)
+                            if cov > 0 {
+                                eff_a := (cov * a + 127) / 255
+                                blend_px(base, row + px, sr, sg, sb, eff_a)
+                            }
+                        }
+                        gx += 1
+                    }
+                }
+                gy += 1
+            }
+        }
+        pen_x += entry.advance_x
+        pos += step
+    }
+}
+
+fn rd_f64(payload &string, off int, fallback f64) f64 {
+    << codec.read_float64(payload, off) or (err) { << fallback }
+}
+
+pub fn (r $&SwRaster) render_xdf(payload &string, fstack &font.FontStack, atl $&font.GlyphAtlas) {
+    if payload.len < 32 || payload[0:4] != "XDF1" { << }
+    r.cursor_saved = false
+    total_len := codec.read_word32(payload, 8)
+    $limit := total_len
+    if limit > payload.len { limit = payload.len }
+
+    base := r.pix_ptr()
+    w := r.width
+    $st := default_state(w, r.height)
+    $stack := []SwState{}
+    $stack_top := 0
+    $cov_row := []int{}
+    for ci in 0:w { cov_row.push(0) }
+
+    $off := 32
+    while off + 8 <= limit {
+        op := codec.read_word32(payload, off)
+        rec_size := codec.read_word32(payload, off + 4)
+        if rec_size < 8 || off + rec_size > limit { <- }
+        p := off + 8
+
+        if op == 1 && rec_size >= 12 {
+            // XDF_BACKGROUND: clear full framebuffer
+            col := codec.read_word32(payload, p)
+            full_st := default_state(r.width, r.height)
+            fill_rect_raw(base, r.width, 0, 0, r.width, r.height, col, &full_st)
+        } else if op == 2 && rec_size >= 12 {
+            col := codec.read_word32(payload, p)
+            st.fill_rgba = col
+            st.stroke_rgba = col
+        } else if op == 3 && rec_size >= 12 {
+            st.fill_rgba = codec.read_word32(payload, p)
+        } else if op == 4 && rec_size >= 12 {
+            st.stroke_rgba = codec.read_word32(payload, p)
+        } else if op == 5 && rec_size >= 16 {
+            st.stroke_w = rd_f64(payload, p, 1.0)
+        } else if op == 6 {
+            if stack_top < stack.len {
+                stack[stack_top] = clone_state(&st)
+            } else {
+                stack.push(clone_state(&st))
+            }
+            stack_top += 1
+        } else if op == 7 {
+            if stack_top > 0 {
+                stack_top -= 1
+                st = stack[stack_top]
+            }
+        } else if op == 8 {
+            st.tx = 0.0
+            st.ty = 0.0
+            st.sx = 1.0
+            st.sy = 1.0
+        } else if op == 9 && rec_size >= 24 {
+            dx := rd_f64(payload, p, 0.0)
+            dy := rd_f64(payload, p + 8, 0.0)
+            st.tx += st.sx * dx
+            st.ty += st.sy * dy
+        } else if op == 11 && rec_size >= 24 {
+            fx := rd_f64(payload, p, 1.0)
+            fy := rd_f64(payload, p + 8, 1.0)
+            st.sx *= fx
+            st.sy *= fy
+        } else if op == 12 && rec_size >= 40 {
+            x := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            cw := st.sx * rd_f64(payload, p + 16, 0.0)
+            ch := st.sy * rd_f64(payload, p + 24, 0.0)
+            nx0 := int(math.floor(x + 0.5))
+            ny0 := int(math.floor(y + 0.5))
+            nx1 := int(math.ceil(x + cw))
+            ny1 := int(math.ceil(y + ch))
+            if nx0 > st.cx0 { st.cx0 = nx0 }
+            if ny0 > st.cy0 { st.cy0 = ny0 }
+            if nx1 < st.cx1 { st.cx1 = nx1 }
+            if ny1 < st.cy1 { st.cy1 = ny1 }
+            if st.cx1 < st.cx0 { st.cx1 = st.cx0 }
+            if st.cy1 < st.cy0 { st.cy1 = st.cy0 }
+        } else if (op == 13 || op == 15) && rec_size >= 40 {
+            x := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            rw := st.sx * rd_f64(payload, p + 16, 0.0)
+            rh := st.sy * rd_f64(payload, p + 24, 0.0)
+            $col := st.fill_rgba
+            if op == 15 && rec_size >= 44 { col = codec.read_word32(payload, p + 32) }
+            fill_rect_raw(base, r.width, int(math.floor(x + 0.5)), int(math.floor(y + 0.5)),
+                          int(math.floor(x + rw + 0.5)), int(math.floor(y + rh + 0.5)), col, &st)
+        } else if (op == 14 || op == 16) && rec_size >= 40 {
+            x := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            rw := st.sx * rd_f64(payload, p + 16, 0.0)
+            rh := st.sy * rd_f64(payload, p + 24, 0.0)
+            $lw := st.stroke_w
+            $col := st.stroke_rgba
+            if op == 16 && rec_size >= 52 {
+                lw = rd_f64(payload, p + 32, 1.0)
+                col = codec.read_word32(payload, p + 40)
+            }
+            bw := int(math.max(1.0, math.floor(lw * st.sx + 0.5)))
+            ix0 := int(math.floor(x + 0.5))
+            iy0 := int(math.floor(y + 0.5))
+            ix1 := int(math.floor(x + rw + 0.5))
+            iy1 := int(math.floor(y + rh + 0.5))
+            fill_rect_raw(base, r.width, ix0, iy0, ix1, iy0 + bw, col, &st)
+            fill_rect_raw(base, r.width, ix0, iy1 - bw, ix1, iy1, col, &st)
+            fill_rect_raw(base, r.width, ix0, iy0, ix0 + bw, iy1, col, &st)
+            fill_rect_raw(base, r.width, ix1 - bw, iy0, ix1, iy1, col, &st)
+        } else if op == 17 && rec_size >= 52 {
+            x1 := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y1 := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            x2 := st.tx + st.sx * rd_f64(payload, p + 16, 0.0)
+            y2 := st.ty + st.sy * rd_f64(payload, p + 24, 0.0)
+            lw := rd_f64(payload, p + 32, 1.0)
+            col := codec.read_word32(payload, p + 40)
+            draw_thick_line(base, r.width, x1, y1, x2, y2, lw * st.sx, col, &st)
+        } else if op == 18 && rec_size >= 36 {
+            tx := rd_f64(payload, p, 0.0)
+            ty := rd_f64(payload, p + 8, 0.0)
+            sz := rd_f64(payload, p + 16, 14.0)
+            col := codec.read_word32(payload, p + 24)
+            txt := payload[p + 28 : off + rec_size]
+            draw_text_op_raw(base, w, fstack, atl, tx, ty, sz, col, &txt, &st)
+        } else if op == 19 && rec_size >= 32 {
+            cx := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            cy := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            rad := st.sx * rd_f64(payload, p + 16, 0.0)
+            fill_circle_raw(base, r.width, cx, cy, rad, st.fill_rgba, &st)
+        } else if op == 20 && rec_size >= 40 {
+            x := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            ew := st.sx * rd_f64(payload, p + 16, 0.0)
+            eh := st.sy * rd_f64(payload, p + 24, 0.0)
+            fill_ellipse_raw(base, r.width, x, y, ew, eh, st.fill_rgba, &st)
+        } else if op == 21 && rec_size >= 56 {
+            x1 := st.tx + st.sx * rd_f64(payload, p, 0.0)
+            y1 := st.ty + st.sy * rd_f64(payload, p + 8, 0.0)
+            x2 := st.tx + st.sx * rd_f64(payload, p + 16, 0.0)
+            y2 := st.ty + st.sy * rd_f64(payload, p + 24, 0.0)
+            x3 := st.tx + st.sx * rd_f64(payload, p + 32, 0.0)
+            y3 := st.ty + st.sy * rd_f64(payload, p + 40, 0.0)
+            $edges := []SwEdge{}
+            push_edge($&edges, x1, y1, x2, y2)
+            push_edge($&edges, x2, y2, x3, y3)
+            push_edge($&edges, x3, y3, x1, y1)
+            miny := math.min(y1, math.min(y2, y3))
+            maxy := math.max(y1, math.max(y2, y3))
+            fill_polygon_edges(base, r.width, &edges, miny, maxy, st.fill_rgba, false, &st, $&cov_row)
+        } else if op == 24 && rec_size >= 56 {
+            render_path_op(base, r.width, payload, p, &st, $&cov_row)
+        }
+
+        off += rec_size
+    }
+}
+
+pub fn (r $&SwRaster) draw_cursor(mx int, my int) {
+    base := r.pix_ptr()
+    unsafe {
+        if r.cursor_saved {
+            $dy := 0
+            while dy < 16 {
+                py := r.cursor_y + dy
+                if py >= 0 && py < r.height {
+                    $dx := 0
+                    while dx < 12 {
+                        px := r.cursor_x + dx
+                        if px >= 0 && px < r.width {
+                            p := ((base as usize) + usize((py * r.width + px) * 4)) as *raw u32
+                            *p = r.saved_bg[dy * 12 + dx]
+                        }
+                        dx += 1
+                    }
+                }
+                dy += 1
+            }
+        }
+        r.cursor_x = mx
+        r.cursor_y = my
+        r.cursor_saved = true
+        $dy := 0
+        while dy < 16 {
+            py := my + dy
+            if py >= 0 && py < r.height {
+                $dx := 0
+                while dx < 12 {
+                    px := mx + dx
+                    if px >= 0 && px < r.width {
+                        p := ((base as usize) + usize((py * r.width + px) * 4)) as *raw u32
+                        r.saved_bg[dy * 12 + dx] = *p
+                        // Arrow silhouette: width shrinks below dy==10
+                        $max_w := dy + 1
+                        if dy >= 11 { max_w = 15 - dy + 2 }
+                        if max_w > 11 { max_w = 11 }
+                        if dx < max_w {
+                            is_edge := dx == 0 || dx == max_w - 1 || dy == 15 || (dy >= 11 && dx >= 5)
+                            if is_edge {
+                                *p = u32(0xFF0B1120)
+                            } else {
+                                *p = u32(0xFFF8FAFC)
+                            }
+                        }
+                    }
+                    dx += 1
+                }
+            }
+            dy += 1
+        }
+    }
+}
+
+pub fn (r $&SwRaster) pixel_sample_hash() int {
+    base := r.pix_ptr()
+    $acc := 0
+    unsafe {
+        $i := 0
+        total := r.width * r.height
+        while i < total {
+            p := ((base as usize) + usize(i * 4)) as *raw u32
+            acc = (acc * 31 + int(*p)) & 0x7FFFFFFF
+            i += 257
+        }
+    }
+    << acc
+}

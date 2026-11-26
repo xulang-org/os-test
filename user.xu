@@ -1,0 +1,1693 @@
+@main
+$freestanding
+
+#core/arch
+#core/elf
+#core/fmt
+#core/mem
+#core/task
+
+const USER_LINUX_BASE = 0x0000000000400000u64
+const USER_LINUX_LIMIT = 0x0000000001000000u64
+const USER_MACHO_BASE = 0x0000000100000000u64
+const USER_MACHO_LIMIT = 0x0000000104000000u64
+
+const USER_VA_BASE = 0x0000008000000000u64
+const USER_VA_LIMIT = 0x0000008100000000u64
+const USER_CODE_VA = 0x0000008000000000u64
+const USER_STACK_VA = 0x0000008000001000u64
+const USER_STACK_TOP = 0x0000008000002000u64
+
+const USER_MMAP_BASE = 0x0000008010000000u64
+const USER_MMAP_LIMIT = 0x0000008100000000u64
+const USER_MACHO_TRAMP_VA = 0x000000800EF00000u64
+const USER_ELF_STACK_BASE = 0x000000800F000000u64
+const USER_ELF_STACK_PAGES = 64 // 256 KiB stack
+const USER_ELF_STACK_TOP = 0x000000800F040000u64
+const USER_KSTACK_BYTES = 4 * PAGE_SIZE
+const MMAP_FREE_CAP = 256
+
+// Legacy native Ring 3 syscalls
+const SYS_WRITE = 1
+const SYS_GETINFO = 2
+const SYS_FS_READ = 3
+const SYS_EXIT = 60
+
+// Linux x86_64 syscalls
+const LNX_READ = 0
+const LNX_WRITE = 1
+const LNX_CLOSE = 3
+const LNX_LSEEK = 8
+const LNX_MMAP = 9
+const LNX_MPROTECT = 10
+const LNX_MUNMAP = 11
+const LNX_SCHED_YIELD = 24
+const LNX_NANOSLEEP = 35
+const LNX_GETPID = 39
+const LNX_FCNTL = 72
+const LNX_CLOCK_GETTIME = 228
+const LNX_EXIT_GROUP = 231
+const LNX_OPENAT = 257
+const LNX_GETRANDOM = 318
+
+// macOS x86_64 Darwin BSD syscalls (0x2000000 + nr)
+const MAC_BASE = 0x02000000u64
+const MAC_EXIT = 1
+const MAC_READ = 3
+const MAC_WRITE = 4
+const MAC_OPEN = 5
+const MAC_CLOSE = 6
+const MAC_GETPID = 20
+const MAC_MUNMAP = 73
+const MAC_MPROTECT = 74
+const MAC_FCNTL = 92
+const MAC_SELECT = 93
+const MAC_GETTIMEOFDAY = 116
+const MAC_MMAP = 197
+const MAC_LSEEK = 199
+const MAC_POLL = 230
+const MAC_GETENTROPY = 500
+
+// Virtual FDs for userland devices/procfs
+const VFD_FB0 = 10
+const VFD_INPUT = 11
+const VFD_STAT = 12
+const VFD_CMD = 13
+const VFD_FILES = 14
+const VFD_MODE = 15
+const VFD_MOTD = 16
+const VFD_FONT = 17
+const VFD_APPOUT = 18
+
+const MACHO_MAGIC_64 = 0xFEEDFACF
+const MACHO_CPU_X86_64 = 0x01000007
+const MACHO_FILETYPE_EXEC = 2
+const LC_SEGMENT_64 = 0x19
+const LC_MAIN = 0x80000028
+
+extern "C" {
+    fn enter_ring3(entry_rip u64, user_rsp u64, cpu_local u64, user_pml4 u64) u64
+    let syscall_entry_asm u8
+    let user_fault_return_asm u8
+    let user_demo_code_start u8
+    let user_demo_code_end u8
+    let os_boot_auto_ui u64
+}
+
+@repr("C", packed)
+pub struct Tss64 {
+    pub reserved0 u32
+    pub rsp0 u64
+    pub rsp1 u64
+    pub rsp2 u64
+    pub reserved1 u64
+    pub ist1 u64
+    pub ist2 u64
+    pub ist3 u64
+    pub ist4 u64
+    pub ist5 u64
+    pub ist6 u64
+    pub ist7 u64
+    pub reserved2 u64
+    pub reserved3 u16
+    pub iomap_base u16
+}
+
+@repr("C")
+pub struct CpuLocal {
+    pub kernel_rsp u64          // 0
+    pub user_rsp_scratch u64    // 8
+    pub saved_rsp u64           // 16
+    pub saved_rbp u64           // 24
+    pub saved_rbx u64           // 32
+    pub saved_r12 u64           // 40
+    pub saved_r13 u64           // 48
+    pub saved_r14 u64           // 56
+    pub saved_r15 u64           // 64
+    pub user_exit_code u64      // 72
+    pub syscall_count u64       // 80
+    pub rejected_ptrs u64       // 88
+    pub saved_cr3 u64           // 96
+    pub fault_vec u64           // 104
+    pub fault_rip u64           // 112
+    pub fault_cr2 u64           // 120
+    pub init_rdi u64            // 128
+    pub init_rsi u64            // 136
+    pub init_rdx u64            // 144
+    pub active_user_pml4 u64    // 152
+    pub mmap_cursor u64         // 160
+    pub ui_smoke_mode u64       // 168
+    pub fb_presents u64         // 176
+    pub guest_abi u64           // 184
+    pub rng_state u64           // 192
+}
+
+static_assert(sizeof(Tss64) == 104 && sizeof(arch.GdtPointer) == 10, "TSS64/GDTR size ABI mismatch")
+static_assert(offsetof(CpuLocal, kernel_rsp) == 0 && offsetof(CpuLocal, user_rsp_scratch) == 8 && offsetof(CpuLocal, saved_rsp) == 16 && offsetof(CpuLocal, user_exit_code) == 72 && offsetof(CpuLocal, saved_cr3) == 96, "CpuLocal asm ABI mismatch")
+static_assert(offsetof(CpuLocal, init_rdi) == 128 && offsetof(CpuLocal, init_rsi) == 136 && offsetof(CpuLocal, init_rdx) == 144, "CpuLocal init reg ABI mismatch")
+
+static user_gdt_template [5]u64 = [0u64, 0x00AF9A000000FFFFu64, 0x00AF92000000FFFFu64, 0x00AFF2000000FFFFu64, 0x00AFFA000000FFFFu64]
+
+@align(16)
+static $user_gdt [7]u64
+static $user_gdtr arch.GdtPointer
+@align(16)
+static $user_tss Tss64
+@align(64)
+static $cpu_local_data CpuLocal
+@align(16)
+static $user_fmt_buf [128]u8
+@align(16)
+static $user_kstack [USER_KSTACK_BYTES]u8
+@repr("C")
+struct MmapFreeSlot {
+    base u64
+    len u64
+}
+
+@align(16)
+static $vfd_eof [32]u8
+@align(16)
+static $vfd_off [32]int
+@align(16)
+static $mmap_free_slots [MMAP_FREE_CAP]MmapFreeSlot
+static $mmap_free_count int
+@align(16)
+static $vproc_buf [2048]u8
+@align(16)
+static $vname_buf [48]u8
+@align(16)
+static $child_path_buf [64]u8
+@align(16)
+static $child_kstack [USER_KSTACK_BYTES]u8
+@align(16)
+static $saved_mmap_slots [MMAP_FREE_CAP]MmapFreeSlot
+@align(16)
+static $saved_vfd_eof [32]u8
+@align(16)
+static $saved_vfd_off [32]int
+@align(16)
+static $app_cap_buf [1024]u8
+static $app_cap_len int
+static $app_cap_active int
+static $app_last_rc u64
+
+pub fn boot_auto_ui() bool {
+    unsafe {
+        p := (&os_boot_auto_ui) as *raw u64
+        << *p != u64(0)
+    }
+}
+
+pub fn cpu_local() *raw CpuLocal {
+    unsafe {
+        << ($&cpu_local_data) as *raw CpuLocal
+    }
+}
+
+pub fn user_is_active() bool {
+    unsafe {
+        cl := cpu_local()
+        << (*cl).active_user_pml4 != u64(0)
+    }
+}
+
+pub fn user_init() {
+    unsafe {
+        gdt_ptr := ($&user_gdt[0]) as *raw u64
+        tss_ptr := ($&user_tss) as *raw Tss64
+        cl_ptr := ($&cpu_local_data) as *raw CpuLocal
+        gdtr := ($&user_gdtr) as *raw arch.GdtPointer
+        kstack_top := ((($&user_kstack[0]) as *raw u8) as u64) + u64(sizeof([USER_KSTACK_BYTES]u8))
+
+        mem.memset(gdt_ptr as *raw u8, u8(0), sizeof([7]u64))
+        mem.memset(tss_ptr as *raw u8, u8(0), sizeof(Tss64))
+        mem.memset(cl_ptr as *raw u8, u8(0), sizeof(CpuLocal))
+
+        for i in 0:5 {
+            user_gdt[i] = user_gdt_template[i]
+        }
+
+        tss_base := tss_ptr as u64
+        tss_limit := u64(sizeof(Tss64) - 1)
+        tss_lo := (tss_limit & u64(0xFFFF)) |
+                  ((tss_base & u64(0xFFFFFF)) << u64(16)) |
+                  (u64(0x89) << u64(40)) |
+                  (((tss_base >> u64(24)) & u64(0xFF)) << u64(56))
+        tss_hi := tss_base >> u64(32)
+        user_gdt[5] = tss_lo
+        user_gdt[6] = tss_hi
+
+        (*tss_ptr).rsp0 = kstack_top
+        (*tss_ptr).iomap_base = u16(sizeof(Tss64))
+
+        *gdtr = arch.GdtPointer{
+            limit: u16(sizeof([7]u64) - 1),
+            base: gdt_ptr as u64
+        }
+        arch.load_gdt(gdtr)
+        arch.load_tr(u16(0x28))
+
+        (*cl_ptr).kernel_rsp = kstack_top
+        (*cl_ptr).rng_state = 0x9E3779B97F4A7C15u64
+
+        efer := arch.rdmsr(u32(arch.MSR_IA32_EFER))
+        arch.wrmsr(u32(arch.MSR_IA32_EFER), efer | u64(1)) // IA32_EFER.SCE
+
+        star := (u64(0x0013) << u64(48)) | (u64(0x0008) << u64(32))
+        arch.wrmsr(u32(arch.MSR_IA32_STAR), star)
+
+        lstar := ((&syscall_entry_asm) as *raw u8) as u64
+        arch.wrmsr(u32(arch.MSR_IA32_LSTAR), lstar)
+        arch.wrmsr(u32(arch.MSR_IA32_FMASK), u64(0x600)) // Mask IF and DF on syscall
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), u64(0))
+        arch.wrmsr(u32(arch.MSR_IA32_KERNEL_GS_BASE), cl_ptr as u64)
+    }
+}
+
+fn user_range_in(ptr u64, len u64, lo u64, hi u64) bool {
+    if ptr < lo || ptr >= hi {
+        << false
+    }
+    << len <= (hi - ptr)
+}
+
+fn user_range_ok(ptr u64, len u64, max_len u64) bool {
+    if len == u64(0) || len > max_len {
+        << false
+    }
+    if user_range_in(ptr, len, USER_VA_BASE, USER_VA_LIMIT) {
+        << true
+    }
+    if user_range_in(ptr, len, USER_LINUX_BASE, USER_LINUX_LIMIT) {
+        << true
+    }
+    << user_range_in(ptr, len, USER_MACHO_BASE, USER_MACHO_LIMIT)
+}
+
+fn user_cstr_eq(user_ptr u64, lit &string) bool {
+    if !user_range_ok(user_ptr, u64(lit.len + 1), u64(128)) {
+        << false
+    }
+    unsafe {
+        $i := 0
+        while i < lit.len {
+            b := *((user_ptr + u64(i)) as *raw u8)
+            if int(b) != (lit[i] & 255) {
+                << false
+            }
+            i += 1
+        }
+        tail := *((user_ptr + u64(lit.len)) as *raw u8)
+        << tail == u8(0)
+    }
+}
+
+fn user_bytes_eq(user_ptr u64, n int, lit &string) bool {
+    if n != lit.len {
+        << false
+    }
+    unsafe {
+        $i := 0
+        while i < n {
+            b := *((user_ptr + u64(i)) as *raw u8)
+            if int(b) != (lit[i] & 255) {
+                << false
+            }
+            i += 1
+        }
+    }
+    << true
+}
+
+pub fn user_handle_demand_pf(cr2 u64, err u64) bool {
+    // Demand-allocate anonymous RW+USER+NX pages inside [USER_MMAP_BASE, mmap_cursor)
+    if (err & u64(1)) != u64(0) {
+        << false
+    }
+    unsafe {
+        cl := cpu_local()
+        pml4 := (*cl).active_user_pml4
+        if pml4 == u64(0) {
+            << false
+        }
+        if cr2 < USER_MMAP_BASE || cr2 >= (*cl).mmap_cursor {
+            << false
+        }
+        page_va := cr2 - (cr2 & u64(0xFFF))
+        if vmm_translate(pml4, page_va) != u64(0) {
+            << false
+        }
+        frame := pmm_alloc_frame()
+        if frame == u64(0) {
+            << false
+        }
+        flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE | VMM_PAGE_USER) | vmm_nx_bit()
+        if !vmm_map_page(pml4, page_va, frame, flags) {
+            pmm_free_frame(frame)
+            << false
+        }
+        vs := vmm_state()
+        (*vs).demand_faults += u64(1)
+    }
+    << true
+}
+
+fn sys_open_vdev(path_ptr u64) u64 {
+    p_fb0 := "/dev/fb0"
+    p_in := "/dev/input"
+    p_stat := "/proc/stat"
+    p_cmd := "/dev/cmd"
+    p_files := "/proc/files"
+    p_mode := "/proc/mode"
+    p_motd := "/etc/motd"
+    p_font := "/etc/font.ttf"
+    p_appout := "/proc/app_out"
+
+    $fd := -1
+    if user_cstr_eq(path_ptr, &p_fb0) { fd = VFD_FB0 }
+    else if user_cstr_eq(path_ptr, &p_in) { fd = VFD_INPUT }
+    else if user_cstr_eq(path_ptr, &p_stat) { fd = VFD_STAT }
+    else if user_cstr_eq(path_ptr, &p_cmd) { fd = VFD_CMD }
+    else if user_cstr_eq(path_ptr, &p_files) { fd = VFD_FILES }
+    else if user_cstr_eq(path_ptr, &p_mode) { fd = VFD_MODE }
+    else if user_cstr_eq(path_ptr, &p_motd) { fd = VFD_MOTD }
+    else if user_cstr_eq(path_ptr, &p_font) { fd = VFD_FONT }
+    else if user_cstr_eq(path_ptr, &p_appout) { fd = VFD_APPOUT }
+
+    if fd < 0 {
+        << 0xFFFFFFFFFFFFFFFEu64 // -ENOENT (-2)
+    }
+    unsafe {
+        vfd_eof[fd] = u8(0)
+        vfd_off[fd] = 0
+    }
+    << u64(fd)
+}
+
+fn sys_read_fd(fd u64, buf u64, len u64) u64 {
+    if len == u64(0) {
+        << u64(0)
+    }
+    if !user_range_ok(buf, len, u64(1048576)) {
+        unsafe {
+            cl := cpu_local()
+            (*cl).rejected_ptrs += u64(1)
+        }
+        << 0xFFFFFFFFFFFFFFF2u64 // -EFAULT (-14)
+    }
+    if fd == u64(VFD_INPUT) {
+        unsafe {
+            cl := cpu_local()
+            if (*cl).ui_smoke_mode == u64(0) && fb_is_ready() {
+                fb_sync_hw_cursor(mouse_get_x(), mouse_get_y())
+            }
+        }
+        n := input_read_events(buf as *raw u8, int(len))
+        << u64(n)
+    }
+    if fd == u64(VFD_FONT) {
+        font_p := "/etc/font.ttf"
+        unsafe {
+            cl := cpu_local()
+            pml4 := (*cl).active_user_pml4
+            for i in 0:font_p.len {
+                vname_buf[i] = u8(font_p[i])
+            }
+            nbuf := ($&vname_buf[0]) as *raw u8
+            pbuf := ($&vproc_buf[0]) as *raw u8
+            $req := int(len)
+            if req > 65536 { req = 65536 }
+            $done := 0
+            while done < req {
+                $chunk := req - done
+                if chunk > 2048 { chunk = 2048 }
+                n := fs_read_at(nbuf, font_p.len, vfd_off[VFD_FONT], pbuf, chunk)
+                if n <= 0 { <- }
+                dst_va := buf + u64(done)
+                // Ensure any fresh demand-paged user page is mapped before kernel memcpy
+                $pva := dst_va - (dst_va & u64(0xFFF))
+                pend := dst_va + u64(n)
+                while pva < pend {
+                    if pml4 != u64(0) && vmm_translate(pml4, pva) == u64(0) {
+                        _ := user_handle_demand_pf(pva, u64(0))
+                    }
+                    pva += u64(4096)
+                }
+                mem.memcpy(dst_va as *raw u8, pbuf, n)
+                vfd_off[VFD_FONT] += n
+                done += n
+            }
+            << u64(done)
+        }
+    }
+    fdi := int(fd)
+    if fdi < 10 || fdi >= 32 {
+        << 0xFFFFFFFFFFFFFFF7u64 // -EBADF (-9)
+    }
+    unsafe {
+        if vfd_eof[fdi] != u8(0) {
+            << u64(0)
+        }
+        pbuf := ($&vproc_buf[0]) as *raw u8
+        $plen := 0
+        if fd == u64(VFD_STAT) {
+            cl := cpu_local()
+            ps := pmm_state()
+            hs := heap_state()
+            ss := sched_state()
+            vs := vmm_state()
+            $fb := fmt.fmt_buf_new(pbuf, usize(sizeof([2048]u8)))
+            fb.write_str("ticks=")
+            fb.write_u64(trap_ticks())
+            fb.write_str(" free_frames=")
+            fb.write_u64(u64((*ps).free_frames))
+            fb.write_str(" total_frames=")
+            fb.write_u64(u64((*ps).total_frames))
+            fb.write_str(" heap_used=")
+            fb.write_u64((*hs).bytes_used)
+            fb.write_str(" heap_size=")
+            fb.write_u64((*hs).size)
+            fb.write_str(" tasks=")
+            fb.write_u64(u64((*ss).task_count))
+            fb.write_str(" demand_pfs=")
+            fb.write_u64((*vs).demand_faults)
+            fb.write_str(" files=")
+            fb.write_u64(u64(fs_file_count()))
+            fb.write_str(" abi=")
+            if (*cl).guest_abi == u64(2) {
+                fb.write_str("macos")
+            } else if (*cl).guest_abi == u64(1) {
+                fb.write_str("linux")
+            } else {
+                fb.write_str("native")
+            }
+            fb.write_byte(u8(10))
+            plen = int(fb.len)
+        } else if fd == u64(VFD_FILES) {
+            $fb := fmt.fmt_buf_new(pbuf, usize(sizeof([2048]u8)))
+            nbuf := ($&vname_buf[0]) as *raw u8
+            $idx := 0
+            while idx < XUFS_MAX_INODES {
+                $sz := u32(0)
+                $sc := u32(0)
+                $fl := u32(0)
+                mem.memset(nbuf, u8(0), 48)
+                if fs_inode_summary(idx, ($&sz) as *raw u32, ($&sc) as *raw u32, ($&fl) as *raw u32, nbuf, 40) {
+                    $k := 0
+                    while k < 40 {
+                        ch := *(((nbuf as usize) + usize(k)) as *raw u8)
+                        if ch == u8(0) { <- }
+                        fb.write_byte(ch)
+                        k += 1
+                    }
+                    fb.write_byte(u8(9))
+                    fb.write_u64(u64(sz))
+                    fb.write_byte(u8(10))
+                }
+                idx += 1
+            }
+            plen = int(fb.len)
+        } else if fd == u64(VFD_MODE) {
+            cl := cpu_local()
+            $fb := fmt.fmt_buf_new(pbuf, usize(sizeof([2048]u8)))
+            if (*cl).ui_smoke_mode != u64(0) {
+                fb.write_str("smoke\n")
+            } else {
+                fb.write_str("interactive\n")
+            }
+            plen = int(fb.len)
+        } else if fd == u64(VFD_MOTD) {
+            motd := "/etc/motd"
+            for i in 0:motd.len {
+                vname_buf[i] = u8(motd[i])
+            }
+            nbuf := ($&vname_buf[0]) as *raw u8
+            plen = fs_read(nbuf, motd.len, pbuf, 512)
+            if plen < 0 { plen = 0 }
+        } else if fd == u64(VFD_APPOUT) {
+            $fb := fmt.fmt_buf_new(pbuf, usize(sizeof([2048]u8)))
+            fb.write_str("exit=")
+            fb.write_u64(app_last_rc)
+            fb.write_byte(u8(10))
+            $ai := 0
+            while ai < app_cap_len {
+                fb.write_byte(app_cap_buf[ai])
+                ai += 1
+            }
+            plen = int(fb.len)
+        }
+        vfd_eof[fdi] = u8(1)
+        $to_copy := plen
+        if u64(to_copy) > len {
+            to_copy = int(len)
+        }
+        if to_copy > 0 {
+            mem.memcpy(buf as *raw u8, pbuf, to_copy)
+        }
+        << u64(to_copy)
+    }
+}
+
+fn sys_write_fd(fd u64, buf u64, len u64) u64 {
+    if len == u64(0) {
+        << u64(0)
+    }
+    if fd == u64(1) || fd == u64(2) {
+        if !user_range_ok(buf, len, u64(65536)) {
+            unsafe {
+                cl := cpu_local()
+                (*cl).rejected_ptrs += u64(1)
+            }
+            << 0xFFFFFFFFFFFFFFFFu64
+        }
+        unsafe {
+            if app_cap_active != 0 {
+                $ci := 0
+                max_c := int(len)
+                while ci < max_c && app_cap_len < 1023 {
+                    app_cap_buf[app_cap_len] = *((buf + u64(ci)) as *raw u8)
+                    app_cap_len += 1
+                    ci += 1
+                }
+            }
+        }
+        serial_put_buf(buf as *raw u8, int(len))
+        << len
+    }
+    if fd == u64(VFD_FB0) {
+        if !user_range_ok(buf, len, u64(FB_BYTES)) {
+            unsafe {
+                cl := cpu_local()
+                (*cl).rejected_ptrs += u64(1)
+            }
+            << 0xFFFFFFFFFFFFFFF2u64
+        }
+        unsafe {
+            cl := cpu_local()
+            if (*cl).ui_smoke_mode == u64(0) && fb_is_ready() {
+                _ := fb_present_raw(buf as *raw u8, int(len))
+            }
+            (*cl).fb_presents += u64(1)
+        }
+        << len
+    }
+    if fd == u64(VFD_CMD) {
+        if !user_range_ok(buf, len, u64(128)) {
+            << 0xFFFFFFFFFFFFFFF2u64
+        }
+        c_spawn := "spawn"
+        c_persist := "persist"
+        c_power := "poweroff"
+        c_run_lnx := "run_linux"
+        c_run_mac := "run_macos"
+        c_run_hello := "run_hello"
+        c_run_fault := "run_fault"
+        n := int(len)
+        if user_bytes_eq(buf, n, &c_spawn) {
+            _ := sched_spawn("dyn_worker", dyn_worker_entry as u64)
+        } else if user_bytes_eq(buf, n, &c_persist) {
+            note_p := "/tmp/ui_note.txt"
+            note_d := "XU-UI-SAVED"
+            unsafe {
+                nb := ($&vname_buf[0]) as *raw u8
+                pb := ($&vproc_buf[0]) as *raw u8
+                for i in 0:note_p.len { *(((nb as usize) + usize(i)) as *raw u8) = u8(note_p[i]) }
+                for i in 0:note_d.len { *(((pb as usize) + usize(i)) as *raw u8) = u8(note_d[i]) }
+                _ := fs_write(nb, note_p.len, pb, note_d.len)
+            }
+        } else if user_bytes_eq(buf, n, &c_run_lnx) {
+            p := "/bin/linux_app"
+            _ := user_exec_subapp(&p)
+        } else if user_bytes_eq(buf, n, &c_run_mac) {
+            p := "/bin/macos_app"
+            _ := user_exec_subapp(&p)
+        } else if user_bytes_eq(buf, n, &c_run_hello) {
+            p := "/bin/hello.elf"
+            _ := user_exec_subapp(&p)
+        } else if user_bytes_eq(buf, n, &c_run_fault) {
+            p := "/bin/fault.elf"
+            _ := user_exec_subapp(&p)
+        } else if user_bytes_eq(buf, n, &c_power) {
+            unsafe {
+                arch.out16(u16(0x604), u16(0x2000))
+            }
+        }
+        << len
+    }
+    << 0xFFFFFFFFFFFFFFF7u64 // -EBADF
+}
+
+fn sys_mmap_anon(len u64) u64 {
+    $sz := len
+    if sz == u64(0) {
+        sz = u64(4096)
+    }
+    aligned := ((sz + u64(4095)) / u64(4096)) * u64(4096)
+    unsafe {
+        $i := 0
+        while i < mmap_free_count {
+            if mmap_free_slots[i].len >= aligned {
+                addr := mmap_free_slots[i].base
+                if mmap_free_slots[i].len == aligned {
+                    mmap_free_count -= 1
+                    mmap_free_slots[i] = mmap_free_slots[mmap_free_count]
+                } else {
+                    mmap_free_slots[i].base += aligned
+                    mmap_free_slots[i].len -= aligned
+                }
+                << addr
+            }
+            i += 1
+        }
+        cl := cpu_local()
+        base := (*cl).mmap_cursor
+        if base == u64(0) || aligned > (USER_MMAP_LIMIT - base) {
+            << 0xFFFFFFFFFFFFFFF4u64 // -ENOMEM (-12)
+        }
+        (*cl).mmap_cursor = base + aligned
+        << base
+    }
+}
+
+fn sys_munmap_anon(addr u64, len u64) u64 {
+    if len == u64(0) || addr < USER_MMAP_BASE || addr >= USER_MMAP_LIMIT {
+        << u64(0)
+    }
+    start := addr - (addr & u64(0xFFF))
+    $aligned := ((len + u64(4095)) / u64(4096)) * u64(4096)
+    unsafe {
+        cl := cpu_local()
+        cursor := (*cl).mmap_cursor
+        if start < USER_MMAP_BASE || start >= cursor || aligned == u64(0) {
+            << u64(0)
+        }
+        max_avail := cursor - start
+        if aligned > max_avail {
+            aligned = max_avail
+        }
+        if (*cl).active_user_pml4 != u64(0) {
+            vmm_unmap_and_free_range((*cl).active_user_pml4, start, aligned)
+        }
+
+        end := start + aligned
+        $li := -1
+        $ri := -1
+        $i := 0
+        while i < mmap_free_count {
+            sb := mmap_free_slots[i].base
+            se := sb + mmap_free_slots[i].len
+            if se == start { li = i }
+            if sb == end { ri = i }
+            i += 1
+        }
+
+        if end == (*cl).mmap_cursor {
+            if li >= 0 {
+                (*cl).mmap_cursor = mmap_free_slots[li].base
+                mmap_free_count -= 1
+                mmap_free_slots[li] = mmap_free_slots[mmap_free_count]
+            } else {
+                (*cl).mmap_cursor = start
+            }
+            << u64(0)
+        }
+
+        if li >= 0 && ri >= 0 {
+            total_end := mmap_free_slots[ri].base + mmap_free_slots[ri].len
+            mmap_free_slots[li].len = total_end - mmap_free_slots[li].base
+            mmap_free_count -= 1
+            if ri < mmap_free_count {
+                mmap_free_slots[ri] = mmap_free_slots[mmap_free_count]
+            }
+        } else if li >= 0 {
+            mmap_free_slots[li].len += aligned
+        } else if ri >= 0 {
+            mmap_free_slots[ri].base = start
+            mmap_free_slots[ri].len += aligned
+        } else if mmap_free_count < MMAP_FREE_CAP {
+            mmap_free_slots[mmap_free_count] = MmapFreeSlot{base: start, len: aligned}
+            mmap_free_count += 1
+        }
+
+        $rewound := true
+        while rewound {
+            rewound = false
+            $k := 0
+            while k < mmap_free_count {
+                if mmap_free_slots[k].base + mmap_free_slots[k].len == (*cl).mmap_cursor {
+                    (*cl).mmap_cursor = mmap_free_slots[k].base
+                    mmap_free_count -= 1
+                    mmap_free_slots[k] = mmap_free_slots[mmap_free_count]
+                    rewound = true
+                    <-
+                }
+                k += 1
+            }
+        }
+    }
+    << u64(0)
+}
+
+fn sys_clock_gettime(ts_ptr u64) u64 {
+    if !user_range_ok(ts_ptr, u64(16), u64(16)) {
+        << 0xFFFFFFFFFFFFFFF2u64
+    }
+    ticks := trap_ticks()
+    sec := ticks / u64(100)
+    nsec := (ticks % u64(100)) * u64(10000000)
+    unsafe {
+        p := ts_ptr as *raw u64
+        *p = sec
+        *((ts_ptr + u64(8)) as *raw u64) = nsec
+    }
+    << u64(0)
+}
+
+fn sys_gettimeofday(tv_ptr u64) u64 {
+    if tv_ptr == u64(0) {
+        << u64(0)
+    }
+    if !user_range_ok(tv_ptr, u64(16), u64(16)) {
+        << 0xFFFFFFFFFFFFFFF2u64
+    }
+    ticks := trap_ticks()
+    sec := ticks / u64(100)
+    usec := (ticks % u64(100)) * u64(10000)
+    unsafe {
+        p := tv_ptr as *raw u64
+        *p = sec
+        *((tv_ptr + u64(8)) as *raw u64) = usec
+    }
+    << u64(0)
+}
+
+fn sys_sleep_tick() u64 {
+    if !input_has_events() {
+        unsafe {
+            cl := cpu_local()
+            if (*cl).ui_smoke_mode == u64(0) && fb_is_ready() {
+                fb_sync_hw_cursor(mouse_get_x(), mouse_get_y())
+            }
+        }
+        arch.sti()
+        arch.halt()
+        arch.cli()
+    }
+    << u64(0)
+}
+
+fn sys_getrandom(buf u64, len u64) u64 {
+    if len == u64(0) {
+        << u64(0)
+    }
+    if !user_range_ok(buf, len, u64(65536)) {
+        << 0xFFFFFFFFFFFFFFF2u64
+    }
+    unsafe {
+        cl := cpu_local()
+        $x := (*cl).rng_state ^ trap_ticks() ^ (*cl).syscall_count
+        $i := u64(0)
+        while i < len {
+            x = x ^ (x << u64(13))
+            x = x ^ (x >> u64(7))
+            x = x ^ (x << u64(17))
+            *((buf + i) as *raw u8) = u8(x & u64(0xFF))
+            i += u64(1)
+        }
+        (*cl).rng_state = x
+    }
+    << len
+}
+
+@export("xu_syscall_dispatch")
+pub fn syscall_dispatch(nr u64, a0 u64, a1 u64, a2 u64, a3 u64, a4 u64) u64 {
+    unsafe {
+        cl := cpu_local()
+        (*cl).syscall_count += u64(1)
+
+        // macOS Darwin BSD syscall class (0x2000000+)
+        if nr >= MAC_BASE {
+            dnr := nr - MAC_BASE
+            if dnr == u64(MAC_EXIT) {
+                (*cl).user_exit_code = a0
+                << a0
+            }
+            if dnr == u64(MAC_READ) {
+                << sys_read_fd(a0, a1, a2)
+            }
+            if dnr == u64(MAC_WRITE) {
+                << sys_write_fd(a0, a1, a2)
+            }
+            if dnr == u64(MAC_OPEN) {
+                << sys_open_vdev(a0)
+            }
+            if dnr == u64(MAC_CLOSE) {
+                if a0 >= u64(10) && a0 < u64(32) {
+                    vfd_eof[int(a0)] = u8(0)
+                    vfd_off[int(a0)] = 0
+                }
+                << u64(0)
+            }
+            if dnr == u64(MAC_LSEEK) {
+                << 0xFFFFFFFFFFFFFFE3u64 // -ESPIPE
+            }
+            if dnr == u64(MAC_MMAP) {
+                << sys_mmap_anon(a1)
+            }
+            if dnr == u64(MAC_MUNMAP) {
+                << sys_munmap_anon(a0, a1)
+            }
+            if dnr == u64(MAC_MPROTECT) || dnr == u64(MAC_FCNTL) {
+                << u64(0)
+            }
+            if dnr == u64(MAC_GETPID) {
+                << u64(1)
+            }
+            if dnr == u64(MAC_SELECT) {
+                // host_sleep_os(t=a4) passes timeval pointer in a4 (r8)
+                << sys_sleep_tick()
+            }
+            if dnr == u64(MAC_GETTIMEOFDAY) {
+                << sys_gettimeofday(a0)
+            }
+            if dnr == u64(MAC_POLL) {
+                << sys_sleep_tick()
+            }
+            if dnr == u64(MAC_GETENTROPY) {
+                _ := sys_getrandom(a0, a1)
+                << u64(0)
+            }
+            << 0xFFFFFFFFFFFFFFB2u64 // -ENOSYS (-78 on Darwin)
+        }
+
+        // Legacy native SYS_GETINFO & SYS_FS_READ (preserved 100%)
+        if nr == u64(SYS_GETINFO) {
+            << u64(0x3300) + trap_ticks()
+        }
+        if nr == u64(SYS_FS_READ) && a0 >= u64(1024) {
+            if !user_range_ok(a0, a1, u64(64)) || !user_range_ok(a2, a3, u64(512)) {
+                (*cl).rejected_ptrs += u64(1)
+                << 0xFFFFFFFFFFFFFFFFu64
+            }
+            n := fs_read(a0 as *raw u8, int(a1), a2 as *raw u8, int(a3))
+            if n < 0 {
+                << 0xFFFFFFFFFFFFFFFFu64
+            }
+            << u64(n)
+        }
+
+        // Linux x86_64 syscalls
+        if nr == u64(LNX_EXIT_GROUP) || nr == u64(SYS_EXIT) {
+            (*cl).user_exit_code = a0
+            << a0
+        }
+        if nr == u64(LNX_READ) {
+            << sys_read_fd(a0, a1, a2)
+        }
+        if nr == u64(LNX_WRITE) {
+            << sys_write_fd(a0, a1, a2)
+        }
+        if nr == u64(LNX_OPENAT) {
+            << sys_open_vdev(a1)
+        }
+        if nr == u64(LNX_CLOSE) {
+            if a0 >= u64(10) && a0 < u64(32) {
+                vfd_eof[int(a0)] = u8(0)
+                vfd_off[int(a0)] = 0
+            }
+            << u64(0)
+        }
+        if nr == u64(LNX_LSEEK) {
+            << 0xFFFFFFFFFFFFFFE3u64 // -ESPIPE
+        }
+        if nr == u64(LNX_MMAP) {
+            << sys_mmap_anon(a1)
+        }
+        if nr == u64(LNX_MUNMAP) {
+            << sys_munmap_anon(a0, a1)
+        }
+        if nr == u64(LNX_MPROTECT) || nr == u64(LNX_FCNTL) || nr == u64(LNX_SCHED_YIELD) {
+            << u64(0)
+        }
+        if nr == u64(LNX_GETPID) {
+            << u64(1)
+        }
+        if nr == u64(LNX_NANOSLEEP) {
+            << sys_sleep_tick()
+        }
+        if nr == u64(LNX_CLOCK_GETTIME) {
+            << sys_clock_gettime(a1)
+        }
+        if nr == u64(LNX_GETRANDOM) {
+            << sys_getrandom(a0, a1)
+        }
+    }
+    // Unused parameter suppression check
+    _ := a4
+    << 0xFFFFFFFFFFFFFFDAu64 // -ENOSYS (-38)
+}
+
+pub fn user_abort_on_fault(tf *raw task.TrapFrame, vec u64, cr2 u64) {
+    unsafe {
+        cl := cpu_local()
+        (*cl).fault_vec = vec
+        (*cl).fault_rip = (*tf).rip
+        (*cl).fault_cr2 = cr2
+        (*cl).active_user_pml4 = u64(0)
+        (*cl).mmap_cursor = u64(0)
+        (*tf).rip = ((&user_fault_return_asm) as *raw u8) as u64
+        (*tf).cs = u64(0x08)
+        (*tf).rflags = u64(0x002) // Keep IF=0 until user_fault_return_asm restores CR3 and RSP
+        (*tf).rsp = (*cl).kernel_rsp
+        (*tf).ss = u64(0x10)
+        (*tf).rdi = cl as u64
+        (*tf).rax = u64(0x100) + vec
+    }
+}
+
+pub fn user_self_test() bool {
+    user_pml4 := vmm_create_user_pml4()
+    if user_pml4 == u64(0) {
+        << false
+    }
+    code_frame := pmm_alloc_frame()
+    if code_frame == u64(0) {
+        vmm_destroy_user_pml4(user_pml4)
+        << false
+    }
+    stack_frame := pmm_alloc_frame()
+    if stack_frame == u64(0) {
+        pmm_free_frame(code_frame)
+        vmm_destroy_user_pml4(user_pml4)
+        << false
+    }
+
+    code_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_USER)
+    stack_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE | VMM_PAGE_USER) | vmm_nx_bit()
+    if !vmm_map_page(user_pml4, USER_CODE_VA, code_frame, code_flags) {
+        pmm_free_frame(code_frame)
+        pmm_free_frame(stack_frame)
+        vmm_destroy_user_pml4(user_pml4)
+        << false
+    }
+    if !vmm_map_page(user_pml4, USER_STACK_VA, stack_frame, stack_flags) {
+        pmm_free_frame(stack_frame)
+        vmm_destroy_user_pml4(user_pml4)
+        << false
+    }
+
+    $ok := true
+    unsafe {
+        src_start := ((&user_demo_code_start) as *raw u8) as u64
+        src_end := ((&user_demo_code_end) as *raw u8) as u64
+        code_len := int(src_end - src_start)
+        if code_len <= 0 || code_len > 4096 {
+            ok = false
+        } else {
+            mem.memset(code_frame as *raw u8, u8(0), 4096)
+            mem.memset(stack_frame as *raw u8, u8(0), 4096)
+            mem.memcpy(code_frame as *raw u8, src_start as *raw u8, code_len)
+
+            cl := cpu_local()
+            (*cl).user_exit_code = u64(0)
+            (*cl).syscall_count = u64(0)
+            (*cl).rejected_ptrs = u64(0)
+            (*cl).fault_vec = u64(0)
+            (*cl).init_rdi = u64(0)
+            (*cl).init_rsi = u64(0)
+            (*cl).init_rdx = u64(0)
+            (*cl).active_user_pml4 = user_pml4
+            (*cl).mmap_cursor = u64(0)
+            (*cl).guest_abi = u64(0)
+
+            cl_addr := cl as u64
+            exit_code := enter_ring3(USER_CODE_VA, USER_STACK_TOP, cl_addr, user_pml4)
+            (*cl).active_user_pml4 = u64(0)
+            if exit_code != u64(42) { ok = false }
+            if (*cl).user_exit_code != u64(42) { ok = false }
+            if (*cl).syscall_count != u64(4) { ok = false }
+            if (*cl).rejected_ptrs != u64(1) { ok = false }
+            if arch.rdmsr(u32(arch.MSR_IA32_GS_BASE)) != u64(0) { ok = false }
+            if arch.rdmsr(u32(arch.MSR_IA32_KERNEL_GS_BASE)) != cl_addr { ok = false }
+            if arch.read_cr3() != vmm_kernel_pml4() { ok = false }
+
+            fmt_ptr := ($&user_fmt_buf[0]) as *raw u8
+            $fb := fmt.fmt_buf_new(fmt_ptr, usize(sizeof([128]u8)))
+            fb.write_str("[USER] Ring3 exit=")
+            fb.write_u64(exit_code)
+            fb.write_str(" syscalls=")
+            fb.write_u64((*cl).syscall_count)
+            fb.write_str(" rejected_kptr=")
+            fb.write_u64((*cl).rejected_ptrs)
+            fb.write_byte(u8(10))
+            serial_put_buf(fb.buf, int(fb.len))
+        }
+    }
+
+    vmm_destroy_user_pml4(user_pml4)
+    << ok
+}
+
+fn rd_u32(p *raw u8, off usize) u32 {
+    unsafe {
+        << *(((p as usize) + off) as *raw u32)
+    }
+}
+
+fn rd_u64(p *raw u8, off usize) u64 {
+    unsafe {
+        << *(((p as usize) + off) as *raw u64)
+    }
+}
+
+fn segname_eq(p *raw u8, name &string) bool {
+    unsafe {
+        $i := 0
+        while i < name.len {
+            b := *(((p as usize) + usize(i)) as *raw u8)
+            if int(b) != (name[i] & 255) {
+                << false
+            }
+            i += 1
+        }
+        tail := *(((p as usize) + usize(name.len)) as *raw u8)
+        << tail == u8(0)
+    }
+}
+
+fn map_seg_pages(user_pml4 u64, file_buf *raw u8, seg_va u64, seg_memsz u64, file_off u64, filesz u64, pte_flags u64) bool {
+    if seg_memsz == u64(0) {
+        << true
+    }
+    seg_end := seg_va + seg_memsz
+    file_end := seg_va + filesz
+    $page_va := seg_va - (seg_va & u64(0xFFF))
+    page_end := ((seg_end + u64(4095)) / u64(4096)) * u64(4096)
+    unsafe {
+        while page_va < page_end {
+            if vmm_translate(user_pml4, page_va) != u64(0) {
+                << false
+            }
+            frame := pmm_alloc_frame()
+            if frame == u64(0) {
+                << false
+            }
+            if page_va < file_end {
+                $c_start := page_va
+                if seg_va > c_start { c_start = seg_va }
+                $c_end := page_va + u64(4096)
+                if file_end < c_end { c_end = file_end }
+                if c_end > c_start {
+                    src_off := file_off + (c_start - seg_va)
+                    dst_off := c_start - page_va
+                    mem.memcpy((frame + dst_off) as *raw u8, ((file_buf as usize) + usize(src_off)) as *raw u8, int(c_end - c_start))
+                }
+            }
+            if !vmm_map_page(user_pml4, page_va, frame, pte_flags) {
+                pmm_free_frame(frame)
+                << false
+            }
+            page_va += u64(4096)
+        }
+    }
+    << true
+}
+
+fn load_elf_binary(bin_buf *raw u8, bin_size int, user_pml4 u64, out_entry *raw u64, out_abi *raw u64) bool {
+    img := elf.elf64_parse(bin_buf, usize(bin_size))
+    if !img.validate_exec(u16(elf.EM_X86_64)) {
+        << false
+    }
+    entry := img.entry()
+    $is_native := false
+    if entry >= USER_VA_BASE && entry < USER_VA_LIMIT {
+        is_native = true
+    } else if entry < USER_LINUX_BASE || entry >= USER_LINUX_LIMIT {
+        << false
+    }
+
+    ph_cnt := img.phdr_count()
+    $pi := 0
+    while pi < ph_cnt {
+        ph := img.phdr_at(pi)
+        unsafe {
+            if (*ph).p_type == u32(elf.PT_LOAD) {
+                if !img.segment_valid(ph) {
+                    << false
+                }
+                seg_start := (*ph).p_vaddr
+                seg_memsz := (*ph).p_memsz
+                if seg_memsz == u64(0) {
+                    pi += 1
+                    ->
+                }
+                $pte_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_USER)
+                pflags := (*ph).p_flags
+                is_w := (pflags & u32(elf.PF_W)) != u32(0)
+                is_x := (pflags & u32(elf.PF_X)) != u32(0)
+
+                if is_native {
+                    if seg_start < USER_VA_BASE || seg_start >= USER_VA_LIMIT || seg_memsz > (USER_VA_LIMIT - seg_start) {
+                        << false
+                    }
+                    if is_w && is_x {
+                        << false
+                    }
+                    if is_w { pte_flags = pte_flags | u64(VMM_PAGE_WRITABLE) }
+                    if !is_x { pte_flags = pte_flags | vmm_nx_bit() }
+                } else {
+                    if seg_start < USER_LINUX_BASE || seg_start >= USER_LINUX_LIMIT || seg_memsz > (USER_LINUX_LIMIT - seg_start) {
+                        << false
+                    }
+                    // Standard Linux ELF64 ET_EXEC may use a single RWE PT_LOAD
+                    if is_w { pte_flags = pte_flags | u64(VMM_PAGE_WRITABLE) }
+                    if !is_x { pte_flags = pte_flags | vmm_nx_bit() }
+                }
+
+                if !map_seg_pages(user_pml4, bin_buf, seg_start, seg_memsz, (*ph).p_offset, (*ph).p_filesz, pte_flags) {
+                    << false
+                }
+            }
+        }
+        pi += 1
+    }
+    unsafe {
+        *out_entry = entry
+        if is_native { *out_abi = u64(0) } else { *out_abi = u64(1) }
+    }
+    << true
+}
+
+fn load_macho_binary(bin_buf *raw u8, bin_size int, user_pml4 u64, out_entry *raw u64) bool {
+    if bin_size < 32 {
+        << false
+    }
+    magic := rd_u32(bin_buf, usize(0))
+    cputype := rd_u32(bin_buf, usize(4))
+    filetype := rd_u32(bin_buf, usize(12))
+    ncmds := int(rd_u32(bin_buf, usize(16)))
+    sizeofcmds := int(rd_u32(bin_buf, usize(20)))
+    if magic != u32(MACHO_MAGIC_64) || cputype != u32(MACHO_CPU_X86_64) || filetype != u32(MACHO_FILETYPE_EXEC) {
+        << false
+    }
+    if sizeofcmds <= 0 || 32 + sizeofcmds > bin_size {
+        << false
+    }
+
+    $text_vmaddr := u64(0)
+    $data_vmaddr := u64(0)
+    $entry_off := u64(0)
+    $has_main := false
+    $off := 32
+    $ci := 0
+    s_text := "__TEXT"
+    s_data := "__DATA"
+    s_dwarf := "__DWARF"
+
+    while ci < ncmds && off + 8 <= 32 + sizeofcmds {
+        cmd_ptr := ((bin_buf as usize) + usize(off)) as *raw u8
+        cmd := rd_u32(cmd_ptr, usize(0))
+        cmdsize := int(rd_u32(cmd_ptr, usize(4)))
+        if cmdsize < 8 || off + cmdsize > 32 + sizeofcmds {
+            << false
+        }
+        if cmd == u32(LC_SEGMENT_64) {
+            if cmdsize < 72 { << false }
+            sname_ptr := ((cmd_ptr as usize) + usize(8)) as *raw u8
+            vmaddr := rd_u64(cmd_ptr, usize(24))
+            vmsize := rd_u64(cmd_ptr, usize(32))
+            fileoff := rd_u64(cmd_ptr, usize(40))
+            filesize := rd_u64(cmd_ptr, usize(48))
+            initprot := rd_u32(cmd_ptr, usize(60))
+
+            if segname_eq(sname_ptr, &s_text) {
+                text_vmaddr = vmaddr
+            } else if segname_eq(sname_ptr, &s_data) {
+                data_vmaddr = vmaddr
+            }
+
+            if vmsize > u64(0) && initprot != u32(0) && !segname_eq(sname_ptr, &s_dwarf) {
+                if vmaddr < USER_MACHO_BASE || vmaddr >= USER_MACHO_LIMIT || vmsize > (USER_MACHO_LIMIT - vmaddr) {
+                    << false
+                }
+                if filesz_bad(fileoff, filesize, u64(bin_size)) {
+                    << false
+                }
+                is_w := (initprot & u32(2)) != u32(0)
+                is_x := (initprot & u32(4)) != u32(0)
+                if is_w && is_x {
+                    << false
+                }
+                $pte_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_USER)
+                if is_w { pte_flags = pte_flags | u64(VMM_PAGE_WRITABLE) }
+                if !is_x { pte_flags = pte_flags | vmm_nx_bit() }
+                if !map_seg_pages(user_pml4, bin_buf, vmaddr, vmsize, fileoff, filesize, pte_flags) {
+                    << false
+                }
+            }
+        } else if cmd == u32(LC_MAIN) {
+            if cmdsize < 24 { << false }
+            entry_off = rd_u64(cmd_ptr, usize(8))
+            has_main = true
+        }
+        off += cmdsize
+        ci += 1
+    }
+
+    if !has_main || text_vmaddr == u64(0) {
+        << false
+    }
+    entry := text_vmaddr + entry_off
+    if entry < USER_MACHO_BASE || entry >= USER_MACHO_LIMIT {
+        << false
+    }
+
+    // Install RX _clock_gettime trampoline page: mov eax, 228; syscall; ret
+    tramp_frame := pmm_alloc_frame()
+    if tramp_frame == u64(0) {
+        << false
+    }
+    unsafe {
+        tb := tramp_frame as *raw u8
+        *(((tb as usize) + usize(0)) as *raw u8) = u8(0xB8)
+        *(((tb as usize) + usize(1)) as *raw u8) = u8(0xE4)
+        *(((tb as usize) + usize(2)) as *raw u8) = u8(0x00)
+        *(((tb as usize) + usize(3)) as *raw u8) = u8(0x00)
+        *(((tb as usize) + usize(4)) as *raw u8) = u8(0x00)
+        *(((tb as usize) + usize(5)) as *raw u8) = u8(0x0F)
+        *(((tb as usize) + usize(6)) as *raw u8) = u8(0x05)
+        *(((tb as usize) + usize(7)) as *raw u8) = u8(0xC3)
+    }
+    if !vmm_map_page(user_pml4, USER_MACHO_TRAMP_VA, tramp_frame, u64(VMM_PAGE_PRESENT | VMM_PAGE_USER)) {
+        pmm_free_frame(tramp_frame)
+        << false
+    }
+    if data_vmaddr != u64(0) {
+        data_pa := vmm_translate(user_pml4, data_vmaddr)
+        if data_pa != u64(0) {
+            unsafe {
+                *(data_pa as *raw u64) = USER_MACHO_TRAMP_VA
+            }
+        }
+    }
+
+    unsafe {
+        *out_entry = entry
+    }
+    << true
+}
+
+fn filesz_bad(fileoff u64, filesize u64, total u64) bool {
+    if fileoff > total { << true }
+    << filesize > (total - fileoff)
+}
+
+fn prepare_user_binary(path *raw u8, path_len int, out_entry *raw u64, out_abi *raw u64, out_rsp *raw u64) u64 {
+    fsize := fs_file_size(path, path_len)
+    if fsize < 32 {
+        << u64(0)
+    }
+    scratch_pages := (fsize + 4095) / 4096
+    bin_phys := pmm_alloc_contiguous(scratch_pages)
+    if bin_phys == u64(0) {
+        << u64(0)
+    }
+    bin_buf := bin_phys as *raw u8
+    n := fs_read(path, path_len, bin_buf, fsize)
+    if n != fsize {
+        pmm_free_contiguous(bin_phys, scratch_pages)
+        << u64(0)
+    }
+
+    user_pml4 := vmm_create_user_pml4()
+    if user_pml4 == u64(0) {
+        pmm_free_contiguous(bin_phys, scratch_pages)
+        << u64(0)
+    }
+
+    $entry := u64(0)
+    $abi := u64(0) // 0=native, 1=linux, 2=macos
+    $load_ok := false
+    magic := rd_u32(bin_buf, usize(0))
+    if magic == u32(0x464C457F) {
+        unsafe {
+            load_ok = load_elf_binary(bin_buf, n, user_pml4, ($&entry) as *raw u64, ($&abi) as *raw u64)
+        }
+    } else if magic == u32(MACHO_MAGIC_64) {
+        abi = u64(2)
+        unsafe {
+            load_ok = load_macho_binary(bin_buf, n, user_pml4, ($&entry) as *raw u64)
+        }
+    }
+
+    // Free binary file buffer immediately before allocating stack & entering Ring 3
+    pmm_free_contiguous(bin_phys, scratch_pages)
+
+    // Map 256 KiB user stack (RW + NX)
+    $si := 0
+    stk_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE | VMM_PAGE_USER) | vmm_nx_bit()
+    while si < USER_ELF_STACK_PAGES && load_ok {
+        va := USER_ELF_STACK_BASE + u64(si * PAGE_SIZE)
+        frame := pmm_alloc_frame()
+        if frame == u64(0) {
+            load_ok = false
+            <-
+        }
+        if !vmm_map_page(user_pml4, va, frame, stk_flags) {
+            pmm_free_frame(frame)
+            load_ok = false
+            <-
+        }
+        si += 1
+    }
+
+    if !load_ok {
+        vmm_destroy_user_pml4(user_pml4)
+        << u64(0)
+    }
+
+    unsafe {
+        $user_rsp := USER_ELF_STACK_TOP - u64(8)
+        if abi == u64(1) {
+            user_rsp = USER_ELF_STACK_TOP - u64(32)
+        } else if abi == u64(2) {
+            user_rsp = USER_ELF_STACK_TOP - u64(16)
+        }
+        *out_entry = entry
+        *out_abi = abi
+        *out_rsp = user_rsp
+    }
+    << user_pml4
+}
+
+fn init_cl_for_abi(cl *raw CpuLocal, user_pml4 u64, abi u64, user_rsp u64) {
+    unsafe {
+        (*cl).user_exit_code = u64(0)
+        (*cl).syscall_count = u64(0)
+        (*cl).rejected_ptrs = u64(0)
+        (*cl).fault_vec = u64(0)
+        (*cl).fault_rip = u64(0)
+        (*cl).fault_cr2 = u64(0)
+        (*cl).fb_presents = u64(0)
+        (*cl).guest_abi = abi
+        (*cl).active_user_pml4 = user_pml4
+        (*cl).mmap_cursor = USER_MMAP_BASE
+        mmap_free_count = 0
+        if abi == u64(2) {
+            (*cl).init_rdi = u64(0)
+            (*cl).init_rsi = user_rsp
+            (*cl).init_rdx = user_rsp
+        } else {
+            (*cl).init_rdi = u64(0)
+            (*cl).init_rsi = u64(0)
+            (*cl).init_rdx = u64(0)
+        }
+    }
+}
+
+pub fn user_run_binary(path *raw u8, path_len int) u64 {
+    $entry := u64(0)
+    $abi := u64(0)
+    $user_rsp := u64(0)
+    $user_pml4 := u64(0)
+    unsafe {
+        user_pml4 = prepare_user_binary(path, path_len, ($&entry) as *raw u64, ($&abi) as *raw u64, ($&user_rsp) as *raw u64)
+    }
+    if user_pml4 == u64(0) {
+        << 0xFFFFFFFFFFFFFFFFu64
+    }
+
+    $exit_code := 0xFFFFFFFFFFFFFFFFu64
+    unsafe {
+        cl := cpu_local()
+        init_cl_for_abi(cl, user_pml4, abi, user_rsp)
+        exit_code = enter_ring3(entry, user_rsp, cl as u64, user_pml4)
+        (*cl).active_user_pml4 = u64(0)
+        (*cl).mmap_cursor = u64(0)
+        mmap_free_count = 0
+    }
+
+    vmm_destroy_user_pml4(user_pml4)
+    << exit_code
+}
+
+fn user_exec_subapp(path &string) u64 {
+    if path.len <= 0 || path.len >= 64 {
+        << 0xFFFFFFFFFFFFFFFFu64
+    }
+    unsafe {
+        pbuf := ($&child_path_buf[0]) as *raw u8
+        for i in 0:path.len {
+            *(((pbuf as usize) + usize(i)) as *raw u8) = u8(path[i] & 255)
+        }
+        $entry := u64(0)
+        $abi := u64(0)
+        $user_rsp := u64(0)
+        child_pml4 := prepare_user_binary(pbuf, path.len, ($&entry) as *raw u64, ($&abi) as *raw u64, ($&user_rsp) as *raw u64)
+        if child_pml4 == u64(0) {
+            app_cap_len = 0
+            app_last_rc = 0xFFFFFFFFFFFFFFFFu64
+            << 0xFFFFFFFFFFFFFFFFu64
+        }
+
+        cl := cpu_local()
+        tss_ptr := ($&user_tss) as *raw Tss64
+        saved_cl := *cl
+        saved_rsp0 := (*tss_ptr).rsp0
+        saved_mfc := mmap_free_count
+        $mi := 0
+        while mi < saved_mfc {
+            saved_mmap_slots[mi] = mmap_free_slots[mi]
+            mi += 1
+        }
+        $vi := 0
+        while vi < 32 {
+            saved_vfd_eof[vi] = vfd_eof[vi]
+            saved_vfd_off[vi] = vfd_off[vi]
+            vfd_eof[vi] = u8(0)
+            vfd_off[vi] = 0
+            vi += 1
+        }
+
+        child_kstack_top := ((($&child_kstack[0]) as *raw u8) as u64) + u64(USER_KSTACK_BYTES)
+        (*tss_ptr).rsp0 = child_kstack_top
+        (*cl).kernel_rsp = child_kstack_top
+        (*cl).ui_smoke_mode = u64(0)
+        init_cl_for_abi(cl, child_pml4, abi, user_rsp)
+
+        app_cap_len = 0
+        app_cap_active = 1
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), u64(0))
+        arch.wrmsr(u32(arch.MSR_IA32_KERNEL_GS_BASE), cl as u64)
+
+        rc := enter_ring3(entry, user_rsp, cl as u64, child_pml4)
+
+        arch.cli()
+        app_cap_active = 0
+        app_last_rc = rc
+        if (*cl).fault_vec != u64(0) && app_cap_len == 0 {
+            $fb := fmt.fmt_buf_new(($&app_cap_buf[0]) as *raw u8, usize(sizeof([1024]u8)))
+            fb.write_str("Contained Ring3 exception vec=")
+            fb.write_u64((*cl).fault_vec)
+            fb.write_str(" cr2=")
+            fb.write_u64((*cl).fault_cr2)
+            app_cap_len = int(fb.len)
+        }
+
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), cl as u64)
+        arch.wrmsr(u32(arch.MSR_IA32_KERNEL_GS_BASE), u64(0))
+        (*tss_ptr).rsp0 = saved_rsp0
+        *cl = saved_cl
+        mmap_free_count = saved_mfc
+        $ri := 0
+        while ri < saved_mfc {
+            mmap_free_slots[ri] = saved_mmap_slots[ri]
+            ri += 1
+        }
+        $vj := 0
+        while vj < 32 {
+            vfd_eof[vj] = saved_vfd_eof[vj]
+            vfd_off[vj] = saved_vfd_off[vj]
+            vj += 1
+        }
+
+        vmm_destroy_user_pml4(child_pml4)
+        << rc
+    }
+}
+
+pub fn user_run_elf(path *raw u8, path_len int) u64 {
+    << user_run_binary(path, path_len)
+}
+
+fn run_bin_path(path &string) u64 {
+    pbuf := pmm_alloc_frame()
+    if pbuf == u64(0) {
+        << 0xFFFFFFFFFFFFFFFFu64
+    }
+    unsafe {
+        for i in 0:path.len {
+            *((pbuf + u64(i)) as *raw u8) = u8(path[i] & 255)
+        }
+    }
+    rc := user_run_binary(pbuf as *raw u8, path.len)
+    pmm_free_frame(pbuf)
+    << rc
+}
+
+pub fn elf_self_test() bool {
+    free_before := pmm_free_frames()
+    p := "/bin/hello.elf"
+    exit_code := run_bin_path(&p)
+
+    $ok := true
+    unsafe {
+        cl := cpu_local()
+        if exit_code != u64(42) || (*cl).user_exit_code != u64(42) { ok = false }
+        if (*cl).syscall_count != u64(5) || (*cl).rejected_ptrs != u64(1) { ok = false }
+        if (*cl).fault_vec != u64(0) { ok = false }
+        if arch.read_cr3() != vmm_kernel_pml4() { ok = false }
+        if arch.rdmsr(u32(arch.MSR_IA32_GS_BASE)) != u64(0) { ok = false }
+        if arch.rdmsr(u32(arch.MSR_IA32_KERNEL_GS_BASE)) != (cl as u64) { ok = false }
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+    if ok {
+        serial_puts("[ELF] Pure-Xu Ring3 ELF64 W^X+NX OK exit=42\n")
+    }
+    << ok
+}
+
+pub fn pf_self_test() bool {
+    free_before := pmm_free_frames()
+    if !vmm_demand_pf_self_test() {
+        << false
+    }
+
+    p := "/bin/fault.elf"
+    exit_code := run_bin_path(&p)
+
+    $ok := true
+    unsafe {
+        cl := cpu_local()
+        if exit_code != u64(0x100 + 14) || (*cl).fault_vec != u64(14) { ok = false }
+        if (*cl).fault_cr2 != u64(0x00100000) { ok = false }
+        if arch.read_cr3() != vmm_kernel_pml4() { ok = false }
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+    if ok {
+        serial_puts("[PF] Demand paging + Ring3 #PF containment OK\n")
+    }
+    << ok
+}
+
+pub fn linux_app_self_test() bool {
+    free_before := pmm_free_frames()
+    p := "/bin/linux_app"
+    exit_code := run_bin_path(&p)
+    $ok := exit_code == u64(0)
+    unsafe {
+        cl := cpu_local()
+        if (*cl).fault_vec != u64(0) { ok = false }
+        if arch.read_cr3() != vmm_kernel_pml4() { ok = false }
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+    if ok {
+        serial_puts("[LINUX-APP] Unmodified Linux x86_64 ELF64 OK\n")
+    }
+    << ok
+}
+
+pub fn macos_app_self_test() bool {
+    free_before := pmm_free_frames()
+    p := "/bin/macos_app"
+    exit_code := run_bin_path(&p)
+    $ok := exit_code == u64(0)
+    unsafe {
+        cl := cpu_local()
+        if (*cl).fault_vec != u64(0) { ok = false }
+        if arch.read_cr3() != vmm_kernel_pml4() { ok = false }
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+    if ok {
+        serial_puts("[MACOS-APP] Unmodified macOS x86_64 Mach-O OK\n")
+    }
+    << ok
+}
+
+pub fn ui_desktop_self_test() bool {
+    free_before := pmm_free_frames()
+    unsafe {
+        cl := cpu_local()
+        (*cl).ui_smoke_mode = u64(1)
+    }
+
+    p_lnx := "/bin/desktop_linux"
+    rc_lnx := run_bin_path(&p_lnx)
+    $ok := rc_lnx == u64(0)
+    unsafe {
+        cl := cpu_local()
+        if (*cl).fault_vec != u64(0) || (*cl).fb_presents < u64(1) { ok = false }
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+
+    p_mac := "/bin/desktop_macos"
+    rc_mac := run_bin_path(&p_mac)
+    if rc_mac != u64(0) {
+        ok = false
+    }
+    unsafe {
+        cl := cpu_local()
+        if (*cl).fault_vec != u64(0) || (*cl).fb_presents < u64(1) { ok = false }
+        (*cl).ui_smoke_mode = u64(0)
+    }
+    if pmm_free_frames() != free_before {
+        ok = false
+    }
+
+    if ok {
+        serial_puts("[UI-WIDGETS] Ring3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O) OK\n")
+    }
+    << ok
+}
+
+pub fn user_run_desktop_session(start_macos bool) {
+    unsafe {
+        cl := cpu_local()
+        (*cl).ui_smoke_mode = u64(0)
+    }
+    $use_mac := start_macos
+    while true {
+        $rc := u64(0)
+        if use_mac {
+            p := "/bin/desktop_macos"
+            serial_puts("[UI] Launching Ring3 #ui/widgets Desktop (macOS x86_64 Mach-O)...\n")
+            rc = run_bin_path(&p)
+        } else {
+            p := "/bin/desktop_linux"
+            serial_puts("[UI] Launching Ring3 #ui/widgets Desktop (Linux x86_64 ELF64)...\n")
+            rc = run_bin_path(&p)
+        }
+        if rc == u64(72) {
+            use_mac = true
+            ->
+        }
+        if rc == u64(71) {
+            use_mac = false
+            ->
+        }
+        <-
+    }
+    // Redraw kernel desktop compositor when returning to shell
+    gui_force_redraw()
+}

@@ -1,0 +1,60 @@
+@main
+$freestanding
+
+#core/arch
+#core/fmt
+
+const SYS_WRITE = 1
+const SYS_GETINFO = 2
+const SYS_FS_READ = 3
+const SYS_EXIT = 60
+
+static hello_motd_path [9]u8 = "/etc/motd"
+static $hello_data_val u64 = 0x1234u64
+static $hello_motd_buf [64]u8
+static $hello_fmt_buf [128]u8
+
+@export("_start")
+@noreturn
+pub fn user_start() {
+    info := arch.syscall0(u64(SYS_GETINFO))
+    if info < u64(0x3300) {
+        arch.syscall1(u64(SYS_EXIT), u64(91))
+    }
+
+    // Negative test: kernel pointer must be rejected by SYS_WRITE
+    bad := arch.syscall3(u64(SYS_WRITE), u64(1), u64(0x100000), u64(8))
+    if bad != 0xFFFFFFFFFFFFFFFFu64 {
+        arch.syscall1(u64(SYS_EXIT), u64(92))
+    }
+
+    unsafe {
+        path_ptr := ((&hello_motd_path[0]) as *raw u8) as u64
+        motd_ptr := (($&hello_motd_buf[0]) as *raw u8) as u64
+        motd_len := arch.syscall4(u64(SYS_FS_READ), path_ptr, u64(9), motd_ptr, u64(64))
+        if motd_len == u64(0) || motd_len > u64(64) {
+            arch.syscall1(u64(SYS_EXIT), u64(93))
+        }
+
+        hello_data_val += u64(1)
+        data_v := hello_data_val
+
+        fmt_ptr := ($&hello_fmt_buf[0]) as *raw u8
+        $fb := fmt.fmt_buf_new(fmt_ptr, usize(128))
+        fb.write_str("[RING3-XU] Hello from pure-Xu ELF! data=")
+        fb.write_u64(data_v)
+        fb.write_str(" motd_bytes=")
+        fb.write_u64(motd_len)
+        fb.write_byte(u8(10))
+        arch.syscall3(u64(SYS_WRITE), u64(1), fb.buf as u64, u64(fb.len))
+    }
+
+    arch.syscall1(u64(SYS_EXIT), u64(42))
+    while true {
+        arch.pause()
+    }
+}
+
+fn main() int {
+    << 0
+}

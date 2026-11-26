@@ -1,0 +1,47 @@
+@main
+
+#os
+#time
+
+fn main() int {
+    abi := xu_target_os()
+    $tag := "GUEST-MACOS"
+    if abi == 1 {
+        tag = "GUEST-LINUX"
+    }
+
+    // 1. Dynamic heap slices & map (backed by demand-paged mmap)
+    $nums := []int{}
+    $sum := 0
+    for i in 1:65 {
+        nums.push(i * i)
+        sum += nums[i - 1]
+    }
+    $m := map[string]int{}
+    m["alpha"] = 100
+    m["beta"] = 200
+    m["gamma"] = 300
+    map_sum := m["alpha"] + m["beta"] + m["gamma"]
+
+    // 2. Monotonic clock (Linux SYS_CLOCK_GETTIME vs macOS _clock_gettime trampoline)
+    t0 := time.instant()
+    t1 := time.instant()
+    dt := t1.since(t0).nanoseconds()
+    if dt < 0 {
+        println("[" + tag + "] FAIL clock")
+        << 1
+    }
+
+    // 3. Read /etc/motd via virtual VFS (Linux openat vs macOS open + read + close)
+    motd := os.read("/etc/motd") or (err) {
+        println("[" + tag + "] FAIL read motd: " + err.msg())
+        << 2
+    }
+    if motd.len < 10 {
+        println("[" + tag + "] FAIL short motd")
+        << 3
+    }
+
+    println("[" + tag + "] abi=" + str(abi) + " sum=" + str(sum) + " map=" + str(map_sum) + " motd=" + str(motd.len) + " OK")
+    << 0
+}

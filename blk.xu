@@ -1,0 +1,172 @@
+@main
+$freestanding
+
+#core/fmt
+#core/mem
+#core/sync
+#core/virtio
+
+@repr("C")
+pub struct BlkState {
+    pub ready u64
+    pub dma_base u64
+    pub drv virtio.VirtioPciBlkDriver
+    pub lock sync.IrqSpinlock
+}
+
+@align(64)
+static $blk_state BlkState
+
+@align(16)
+static $blk_fmt_buf [128]u8
+
+pub fn blk_init() bool {
+    unsafe {
+        if blk_state.ready != u64(0) {
+            << false
+        }
+    }
+    dma_phys := pmm_alloc_contiguous(4)
+    if dma_phys == u64(0) {
+        << false
+    }
+
+    unsafe {
+        blk_state.ready = u64(0)
+        blk_state.dma_base = dma_phys
+        blk_state.drv = virtio.virtio_pci_blk_new()
+        blk_state.lock = sync.irq_spinlock_new()
+        if !blk_state.drv.init_pci(dma_phys, u64(16384)) {
+            pmm_free_contiguous(dma_phys, 4)
+            blk_state.dma_base = u64(0)
+            << false
+        }
+        blk_state.ready = u64(1)
+    }
+    << true
+}
+
+pub fn blk_capacity_sectors() u64 {
+    unsafe {
+        if blk_state.ready == u64(0) {
+            << u64(0)
+        }
+        << blk_state.drv.capacity_sectors
+    }
+}
+
+pub fn blk_read_sector(sector u64, buf *raw u8) bool {
+    unsafe {
+        if blk_state.ready == u64(0) {
+            << false
+        }
+        guard := blk_state.lock.acquire()
+        << blk_state.drv.read_sector(sector, buf)
+    }
+}
+
+pub fn blk_read_sectors(sector u64, count int, buf *raw u8) bool {
+    unsafe {
+        if blk_state.ready == u64(0) {
+            << false
+        }
+        guard := blk_state.lock.acquire()
+        << blk_state.drv.read_sectors(sector, count, buf)
+    }
+}
+
+pub fn blk_write_sector(sector u64, buf *raw u8) bool {
+    unsafe {
+        if blk_state.ready == u64(0) {
+            << false
+        }
+        guard := blk_state.lock.acquire()
+        << blk_state.drv.write_sector(sector, buf)
+    }
+}
+
+pub fn blk_self_test() bool {
+    page := pmm_alloc_frame()
+    if page == u64(0) {
+        << false
+    }
+
+    wr_buf := page as *raw u8
+    rd_buf := (page + u64(512)) as *raw u8
+    s0_buf := (page + u64(1024)) as *raw u8
+
+    $ok := true
+    $cap := u64(0)
+    unsafe {
+        if (((&blk_state as *raw BlkState) as usize) & usize(63)) != usize(0) {
+            ok = false
+        }
+        if ((((&blk_fmt_buf[0]) as *raw u8) as usize) & usize(15)) != usize(0) {
+            ok = false
+        }
+        if blk_state.ready == u64(0) {
+            pmm_free_frame(page)
+            << false
+        }
+        guard := blk_state.lock.acquire()
+        cap = blk_state.drv.capacity_sectors
+        if cap < u64(2) {
+            ok = false
+        }
+
+        if ok {
+            mem.memset(s0_buf, u8(0), 512)
+            if !blk_state.drv.read_sector(u64(0), s0_buf) {
+                ok = false
+            } else {
+                seed := "XU-HOST-SEED-SECTOR0"
+                for i in 0:20 {
+                    p := ((s0_buf as usize) + usize(i)) as *raw u8
+                    if int(*p) != (seed[i] & 255) {
+                        ok = false
+                    }
+                }
+            }
+        }
+
+        if ok {
+            marker := "XU-OS-VIRTIO-BLK-DMA-OK!"
+            for i in 0:512 {
+                $v := u8((i * 7 + 3) & 0xFF)
+                if i < marker.len {
+                    v = u8(marker[i])
+                }
+                p := ((wr_buf as usize) + usize(i)) as *raw u8
+                *p = v
+            }
+            if !blk_state.drv.write_sector(u64(1), wr_buf) {
+                ok = false
+            }
+        }
+
+        if ok {
+            mem.memset(rd_buf, u8(0), 512)
+            if !blk_state.drv.read_sector(u64(1), rd_buf) {
+                ok = false
+            } else if mem.memcmp(wr_buf, rd_buf, 512) != 0 {
+                ok = false
+            }
+        }
+    }
+
+    if ok {
+        unsafe {
+            fmt_ptr := ($&blk_fmt_buf[0]) as *raw u8
+            $fb := fmt.fmt_buf_new(fmt_ptr, usize(128))
+            fb.write_str("[BLK] VirtIO-PCI DMA RW OK sectors=")
+            fb.write_u64(cap)
+            fb.write_str(" (")
+            fb.write_u64(cap / u64(2))
+            fb.write_str(" KiB)\n")
+            serial_put_buf(fb.buf, int(fb.len))
+        }
+    }
+
+    pmm_free_frame(page)
+    << ok
+}

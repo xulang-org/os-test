@@ -1,0 +1,210 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/task
+
+const NUM_ISR_STUBS = 48
+
+extern "C" {
+    let os_boot_info BootInfo
+    let isr_stub_table u64
+    let _kernel_end u8
+}
+
+@repr("C")
+pub struct BootInfo {
+    pub magic u64
+    pub mb_magic u64
+    pub mem_upper_kb u64
+    pub isr_table_addr u64
+    pub trap_handler_slot u64
+    pub xu_kernel_entry u64
+    pub xu_kernel_end u64
+    pub boot_pml4 u64
+}
+
+@repr("C")
+pub struct TrapStats {
+    pub timer_ticks u64
+    pub serial_irqs u64
+    pub total_irqs u64
+    pub exception_count u64
+    pub last_exc_vec u64
+    pub last_exc_rip u64
+    pub last_exc_cr2 u64
+    pub spurious_irqs u64
+}
+
+static_assert(sizeof(BootInfo) == 64 && offsetof(BootInfo, isr_table_addr) == 24 && offsetof(BootInfo, trap_handler_slot) == 32, "BootInfo ABI mismatch")
+static_assert(sizeof(arch.IdtEntry) == 16 && sizeof(arch.IdtPointer) == 10 && sizeof(task.TrapFrame) == 176, "IDT/TrapFrame ABI mismatch")
+
+@align(16)
+static $idt_table [256]arch.IdtEntry
+
+static $idtr arch.IdtPointer
+static $g_trap_stats TrapStats
+
+pub fn boot_info() *raw BootInfo {
+    unsafe {
+        << (&os_boot_info) as *raw BootInfo
+    }
+}
+
+pub fn trap_stats() *raw TrapStats {
+    unsafe {
+        << ($&g_trap_stats) as *raw TrapStats
+    }
+}
+
+pub fn trap_ticks() u64 {
+    unsafe {
+        ts := trap_stats()
+        << volatile_read((&(*ts).timer_ticks) as *raw u64)
+    }
+}
+
+@export("xu_trap_handler")
+pub fn trap_handler(tf *raw task.TrapFrame) u64 {
+    unsafe {
+        vec := (*tf).vec
+        ts := trap_stats()
+        if vec < u64(32) {
+            cr2 := arch.read_cr2()
+            is_user := ((*tf).cs & u64(3)) == u64(3)
+            if vec == u64(14) && !is_user {
+                if vmm_handle_demand_pf(cr2, (*tf).error_code) {
+                    << tf as u64
+                }
+            }
+            if vec == u64(14) && is_user {
+                if user_handle_demand_pf(cr2, (*tf).error_code) {
+                    << tf as u64
+                }
+            }
+            (*ts).exception_count += u64(1)
+            (*ts).last_exc_vec = vec
+            (*ts).last_exc_rip = (*tf).rip
+            (*ts).last_exc_cr2 = cr2
+            if is_user {
+                serial_puts("[USER EXCEPTION] Contained Ring3 fault vec=")
+                serial_put_dec(int(vec))
+                serial_puts(" err=")
+                serial_put_hex((*tf).error_code)
+                serial_puts(" cr2=")
+                serial_put_hex(cr2)
+                serial_puts("\n")
+                user_abort_on_fault(tf, vec, cr2)
+                << tf as u64
+            }
+
+            serial_puts("\n[KERNEL EXCEPTION] vec=")
+            serial_put_dec(int(vec))
+            serial_puts(" err=")
+            serial_put_hex((*tf).error_code)
+            serial_puts(" rip=")
+            serial_put_hex((*tf).rip)
+            serial_puts(" rsp=")
+            serial_put_hex((*tf).rsp)
+            serial_puts(" cr2=")
+            serial_put_hex(cr2)
+            serial_puts("\n")
+            arch.cli()
+            kernel_halt_forever()
+            << tf as u64
+        }
+
+        if vec == u64(32) {
+            (*ts).timer_ticks += u64(1)
+            (*ts).total_irqs += u64(1)
+            arch.pic_eoi(u8(0))
+            if user_is_active() || ((*tf).cs & u64(3)) == u64(3) {
+                << tf as u64
+            }
+            << sched_on_timer_tick(tf)
+        }
+
+        if vec == u64(33) {
+            (*ts).total_irqs += u64(1)
+            input_on_kbd_irq()
+            arch.pic_eoi(u8(1))
+            << tf as u64
+        }
+
+        if vec == u64(36) {
+            (*ts).serial_irqs += u64(1)
+            (*ts).total_irqs += u64(1)
+            serial_on_irq()
+            arch.pic_eoi(u8(4))
+            << tf as u64
+        }
+
+        if vec == u64(39) {
+            (*ts).spurious_irqs += u64(1)
+            << tf as u64
+        }
+
+        if vec == u64(44) {
+            (*ts).total_irqs += u64(1)
+            input_on_mouse_irq()
+            arch.pic_eoi(u8(12))
+            << tf as u64
+        }
+
+        (*ts).total_irqs += u64(1)
+        arch.pic_eoi(u8(int(vec) - 32))
+        << tf as u64
+    }
+}
+
+pub fn idt_init() {
+    unsafe {
+        idt_base_ptr := ($&idt_table[0]) as *raw arch.IdtEntry
+        mem.memset(idt_base_ptr as *raw u8, u8(0), sizeof([256]arch.IdtEntry))
+        mem.memset((($&g_trap_stats) as *raw TrapStats) as *raw u8, u8(0), sizeof(TrapStats))
+
+        isr_table := ((&isr_stub_table) as *raw u64) as u64
+
+        $i := 0
+        while i < NUM_ISR_STUBS {
+            stub_ptr := (isr_table + u64(i * 8)) as *raw u64
+            stub_addr := *stub_ptr
+
+            $gate := arch.IdtEntry{
+                offset_low: u16(0),
+                selector: u16(0),
+                ist: u8(0),
+                type_attr: u8(0),
+                offset_mid: u16(0),
+                offset_high: u32(0),
+                zero: u32(0)
+            }
+            gate.set_gate(stub_addr, u16(0x08), u8(arch.IDT_ATTR_INT32))
+
+            idt_table[i] = gate
+            i += 1
+        }
+
+        // Load IDTR
+        idtr = arch.IdtPointer{
+            limit: u16(sizeof([256]arch.IdtEntry) - 1),
+            base: idt_base_ptr as u64
+        }
+        arch.load_idt(($&idtr) as *raw arch.IdtPointer)
+
+        // Remap 8259A PIC to vectors 32..47 (leaves all IRQs masked until idt_enable_irqs())
+        arch.pic_remap(u8(32), u8(40))
+
+        // Configure 8254 PIT Channel 0 at 100 Hz (10 ms tick)
+        arch.pit_init(u32(100))
+    }
+}
+
+pub fn idt_enable_irqs() {
+    // Unmask IRQ0 (PIT timer), IRQ1 (PS/2 keyboard), IRQ4 (COM1 serial), IRQ12 (PS/2 mouse)
+    arch.pic_unmask(u8(0))
+    arch.pic_unmask(u8(1))
+    arch.pic_unmask(u8(4))
+    arch.pic_unmask(u8(12))
+}

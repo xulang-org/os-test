@@ -1,0 +1,547 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/sync
+
+pub const VMM_PAGE_PRESENT = 1
+pub const VMM_PAGE_WRITABLE = 2
+pub const VMM_PAGE_USER = 4
+pub const VMM_PAGE_PWT = 8
+pub const VMM_PAGE_PCD = 16
+pub const VMM_PAGE_HUGE = 0x80
+pub const VMM_PAGE_NX = 0x8000000000000000u64
+pub const DEMAND_VA_BASE = 0x0000004000100000u64
+pub const DEMAND_VA_LIMIT = 0x0000004000200000u64
+const VMM_ADDR_MASK = 0x000FFFFFFFFFF000
+const VMM_HUGE_MASK = 0x000FFFFFFFE00000
+
+@repr("C")
+pub struct VmmState {
+    pub kernel_pml4 u64
+    pub active_mapped_pages int
+    pub pt_frames_allocated int
+    pub nx_enabled int
+    pub demand_faults u64
+    pub lock sync.IrqSpinlock
+}
+
+static $g_vmm_state VmmState
+
+pub fn vmm_state() *raw VmmState {
+    unsafe {
+        << ($&g_vmm_state) as *raw VmmState
+    }
+}
+
+pub fn vmm_kernel_pml4() u64 {
+    unsafe {
+        st := vmm_state()
+        << (*st).kernel_pml4
+    }
+}
+
+pub fn vmm_init() bool {
+    unsafe {
+        mem.memset((($&g_vmm_state) as *raw VmmState) as *raw u8, u8(0), sizeof(VmmState))
+    }
+
+    pml4 := pmm_alloc_frame()
+    pdpt := pmm_alloc_frame()
+    pd := pmm_alloc_frame()
+    if pml4 == u64(0) || pdpt == u64(0) || pd == u64(0) {
+        << false
+    }
+
+    unsafe {
+        p_pml4 := pml4 as *raw u64
+        *p_pml4 = pdpt | u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE)
+
+        p_pdpt := pdpt as *raw u64
+        *p_pdpt = pd | u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE)
+
+        // Identity-map [0, 128 MiB) via 64 x 2 MiB huge pages
+        $i := 0
+        while i < 64 {
+            slot := (pd + u64(i * 8)) as *raw u64
+            *slot = u64(i * 0x200000) | u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE | VMM_PAGE_HUGE)
+            i += 1
+        }
+
+        $nx_ok := 0
+        $cp := arch.CpuidResult{eax: u32(0), ebx: u32(0), ecx: u32(0), edx: u32(0)}
+        arch.cpuid(u32(0x80000000), u32(0), (&cp) as *raw arch.CpuidResult)
+        if cp.eax >= u32(0x80000001) {
+            arch.cpuid(u32(0x80000001), u32(0), (&cp) as *raw arch.CpuidResult)
+            if (cp.edx & u32(1 << 20)) != u32(0) {
+                efer := arch.rdmsr(u32(arch.MSR_IA32_EFER))
+                arch.wrmsr(u32(arch.MSR_IA32_EFER), efer | u64(1 << 11))
+                nx_ok = 1
+            }
+        }
+
+        st := vmm_state()
+        *st = VmmState{
+            kernel_pml4: pml4,
+            active_mapped_pages: 0,
+            pt_frames_allocated: 3,
+            nx_enabled: nx_ok,
+            demand_faults: u64(0),
+            lock: sync.irq_spinlock_new()
+        }
+
+        arch.write_cr3(pml4)
+        cr3_now := arch.read_cr3()
+        << cr3_now == pml4
+    }
+}
+
+pub fn vmm_nx_bit() u64 {
+    unsafe {
+        st := vmm_state()
+        if (*st).nx_enabled != 0 {
+            << VMM_PAGE_NX
+        }
+    }
+    << u64(0)
+}
+
+pub fn vmm_create_user_pml4() u64 {
+    user_pml4 := pmm_alloc_frame()
+    if user_pml4 == u64(0) {
+        << u64(0)
+    }
+    user_pdpt := pmm_alloc_frame()
+    if user_pdpt == u64(0) {
+        pmm_free_frame(user_pml4)
+        << u64(0)
+    }
+    user_pd0 := pmm_alloc_frame()
+    if user_pd0 == u64(0) {
+        pmm_free_frame(user_pdpt)
+        pmm_free_frame(user_pml4)
+        << u64(0)
+    }
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+        kp := (*st).kernel_pml4 as *raw u64
+        k_pdpt := (*kp) & u64(VMM_ADDR_MASK)
+        k_pd0 := (*(k_pdpt as *raw u64)) & u64(VMM_ADDR_MASK)
+
+        mem.memcpy(user_pdpt as *raw u8, k_pdpt as *raw u8, 4096)
+        mem.memcpy(user_pd0 as *raw u8, k_pd0 as *raw u8, 4096)
+
+        // Carve out [0x400000, 0x1000000) (12 MiB) in user_pd0[2..7] for Linux ELF64 userland
+        $i := 2
+        while i < 8 {
+            *((user_pd0 + u64(i * 8)) as *raw u64) = u64(0)
+            i += 1
+        }
+
+        // Preserve VMM_PAGE_USER on user PDPT[0] and PML4[0] so Ring 3 can traverse to [0x400000, 0x1000000),
+        // while supervisor-only 2 MiB huge pages in user_pd0[0..1, 8..63] and PDPT[3] remain Ring 0 only.
+        pd_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE | VMM_PAGE_USER)
+        *((user_pdpt) as *raw u64) = user_pd0 | pd_flags
+        *((user_pml4) as *raw u64) = user_pdpt | pd_flags
+        (*st).pt_frames_allocated += 3
+    }
+    << user_pml4
+}
+
+pub fn vmm_destroy_user_pml4(user_pml4 u64) {
+    if user_pml4 == u64(0) {
+        <<
+    }
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+        if user_pml4 == (*st).kernel_pml4 {
+            <<
+        }
+        if arch.read_cr3() == user_pml4 {
+            arch.write_cr3((*st).kernel_pml4)
+        }
+
+        // Clean up cloned PML4[0] entries (user_pdpt + user_pd0[2..7] + Mach-O PDPT[4..511])
+        e4_0 := *((user_pml4) as *raw u64)
+        if (e4_0 & u64(VMM_PAGE_PRESENT)) != u64(0) {
+            user_pdpt := e4_0 & u64(VMM_ADDR_MASK)
+            // 1. i3 == 0: private user_pd0
+            e3_0 := *((user_pdpt) as *raw u64)
+            if (e3_0 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e3_0 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                user_pd0 := e3_0 & u64(VMM_ADDR_MASK)
+                $i2 := 2
+                while i2 < 8 {
+                    e2 := *((user_pd0 + u64(i2 * 8)) as *raw u64)
+                    if (e2 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e2 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                        pt := e2 & u64(VMM_ADDR_MASK)
+                        $i1 := 0
+                        while i1 < 512 {
+                            e1 := *((pt + u64(i1 * 8)) as *raw u64)
+                            if (e1 & u64(VMM_PAGE_PRESENT)) != u64(0) {
+                                pmm_free_frame(e1 & u64(VMM_ADDR_MASK))
+                                (*st).active_mapped_pages -= 1
+                            }
+                            i1 += 1
+                        }
+                        pmm_free_frame(pt)
+                        (*st).pt_frames_allocated -= 1
+                    }
+                    i2 += 1
+                }
+                pmm_free_frame(user_pd0)
+                (*st).pt_frames_allocated -= 1
+            }
+
+            // 2. i3 >= 4: Mach-O 64-bit address space (0x100000000+); skip i3 == 1..3 (shared kernel MMIO)
+            $i3_hi := 4
+            while i3_hi < 512 {
+                e3 := *((user_pdpt + u64(i3_hi * 8)) as *raw u64)
+                if (e3 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e3 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                    pd := e3 & u64(VMM_ADDR_MASK)
+                    $i2 := 0
+                    while i2 < 512 {
+                        e2 := *((pd + u64(i2 * 8)) as *raw u64)
+                        if (e2 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e2 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                            pt := e2 & u64(VMM_ADDR_MASK)
+                            $i1 := 0
+                            while i1 < 512 {
+                                e1 := *((pt + u64(i1 * 8)) as *raw u64)
+                                if (e1 & u64(VMM_PAGE_PRESENT)) != u64(0) {
+                                    pmm_free_frame(e1 & u64(VMM_ADDR_MASK))
+                                    (*st).active_mapped_pages -= 1
+                                }
+                                i1 += 1
+                            }
+                            pmm_free_frame(pt)
+                            (*st).pt_frames_allocated -= 1
+                        }
+                        i2 += 1
+                    }
+                    pmm_free_frame(pd)
+                    (*st).pt_frames_allocated -= 1
+                }
+                i3_hi += 1
+            }
+
+            pmm_free_frame(user_pdpt)
+            (*st).pt_frames_allocated -= 1
+        }
+
+        // Clean up PML4[1..511] (e.g. 0x8000000000 native ELF, mmap arena, user stack)
+        $i4 := 1
+        while i4 < 512 {
+            e4 := *((user_pml4 + u64(i4 * 8)) as *raw u64)
+            if (e4 & u64(VMM_PAGE_PRESENT)) != u64(0) {
+                pdpt := e4 & u64(VMM_ADDR_MASK)
+                $i3 := 0
+                while i3 < 512 {
+                    e3 := *((pdpt + u64(i3 * 8)) as *raw u64)
+                    if (e3 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e3 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                        pd := e3 & u64(VMM_ADDR_MASK)
+                        $i2 := 0
+                        while i2 < 512 {
+                            e2 := *((pd + u64(i2 * 8)) as *raw u64)
+                            if (e2 & u64(VMM_PAGE_PRESENT)) != u64(0) && (e2 & u64(VMM_PAGE_HUGE)) == u64(0) {
+                                pt := e2 & u64(VMM_ADDR_MASK)
+                                $i1 := 0
+                                while i1 < 512 {
+                                    e1 := *((pt + u64(i1 * 8)) as *raw u64)
+                                    if (e1 & u64(VMM_PAGE_PRESENT)) != u64(0) {
+                                        pmm_free_frame(e1 & u64(VMM_ADDR_MASK))
+                                        (*st).active_mapped_pages -= 1
+                                    }
+                                    i1 += 1
+                                }
+                                pmm_free_frame(pt)
+                                (*st).pt_frames_allocated -= 1
+                            }
+                            i2 += 1
+                        }
+                        pmm_free_frame(pd)
+                        (*st).pt_frames_allocated -= 1
+                    }
+                    i3 += 1
+                }
+                pmm_free_frame(pdpt)
+                (*st).pt_frames_allocated -= 1
+            }
+            i4 += 1
+        }
+        pmm_free_frame(user_pml4)
+        (*st).pt_frames_allocated -= 1
+    }
+}
+
+pub fn vmm_unmap_and_free_range(pml4 u64, start_va u64, len u64) {
+    if pml4 == u64(0) || len == u64(0) {
+        <<
+    }
+    $va := start_va - (start_va & u64(0xFFF))
+    end_va := ((start_va + len + u64(4095)) / u64(4096)) * u64(4096)
+    while va < end_va {
+        pa := vmm_translate(pml4, va)
+        if pa != u64(0) {
+            if vmm_unmap_page(pml4, va) {
+                pmm_free_frame(pa - (pa & u64(0xFFF)))
+            }
+        }
+        va += u64(4096)
+    }
+}
+
+fn vmm_ensure_next_table(table u64, idx int, st *raw VmmState, user_access bool) u64 {
+    unsafe {
+        slot := (table + u64(idx * 8)) as *raw u64
+        entry := *slot
+        if (entry & u64(VMM_PAGE_PRESENT)) != u64(0) {
+            if (entry & u64(VMM_PAGE_HUGE)) != u64(0) {
+                << u64(0)
+            }
+            if user_access && (entry & u64(VMM_PAGE_USER)) == u64(0) {
+                *slot = entry | u64(VMM_PAGE_USER)
+            }
+            << entry & u64(VMM_ADDR_MASK)
+        }
+        new_tbl := pmm_alloc_frame()
+        if new_tbl == u64(0) {
+            << u64(0)
+        }
+        (*st).pt_frames_allocated += 1
+        $tbl_flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE)
+        if user_access {
+            tbl_flags = tbl_flags | u64(VMM_PAGE_USER)
+        }
+        *slot = new_tbl | tbl_flags
+        << new_tbl
+    }
+}
+
+pub fn vmm_map_page(pml4 u64, virt u64, phys u64, flags u64) bool {
+    i4 := int((virt >> u64(39)) & u64(0x1FF))
+    i3 := int((virt >> u64(30)) & u64(0x1FF))
+    i2 := int((virt >> u64(21)) & u64(0x1FF))
+    i1 := int((virt >> u64(12)) & u64(0x1FF))
+    want_user := (flags & u64(VMM_PAGE_USER)) != u64(0)
+
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+
+        pdpt := vmm_ensure_next_table(pml4, i4, st, want_user)
+        if pdpt == u64(0) { << false }
+
+        pd := vmm_ensure_next_table(pdpt, i3, st, want_user)
+        if pd == u64(0) { << false }
+
+        pt := vmm_ensure_next_table(pd, i2, st, want_user)
+        if pt == u64(0) { << false }
+
+        pte := (pt + u64(i1 * 8)) as *raw u64
+        was_present := (*pte & u64(VMM_PAGE_PRESENT)) != u64(0)
+        *pte = (phys & u64(VMM_ADDR_MASK)) | flags | u64(VMM_PAGE_PRESENT)
+        arch.invlpg(virt)
+        if !was_present {
+            (*st).active_mapped_pages += 1
+        }
+        << true
+    }
+}
+
+pub fn vmm_map_huge_2m(pml4 u64, virt u64, phys u64, flags u64) bool {
+    i4 := int((virt >> u64(39)) & u64(0x1FF))
+    i3 := int((virt >> u64(30)) & u64(0x1FF))
+    i2 := int((virt >> u64(21)) & u64(0x1FF))
+
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+
+        pdpt := vmm_ensure_next_table(pml4, i4, st, false)
+        if pdpt == u64(0) { << false }
+
+        pd := vmm_ensure_next_table(pdpt, i3, st, false)
+        if pd == u64(0) { << false }
+
+        pde := (pd + u64(i2 * 8)) as *raw u64
+        *pde = (phys & u64(VMM_HUGE_MASK)) | flags | u64(VMM_PAGE_PRESENT | VMM_PAGE_HUGE)
+        arch.invlpg(virt)
+        << true
+    }
+}
+
+pub fn vmm_unmap_page(pml4 u64, virt u64) bool {
+    i4 := int((virt >> u64(39)) & u64(0x1FF))
+    i3 := int((virt >> u64(30)) & u64(0x1FF))
+    i2 := int((virt >> u64(21)) & u64(0x1FF))
+    i1 := int((virt >> u64(12)) & u64(0x1FF))
+
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+
+        e4 := *((pml4 + u64(i4 * 8)) as *raw u64)
+        if (e4 & u64(VMM_PAGE_PRESENT)) == u64(0) { << false }
+        pdpt := e4 & u64(VMM_ADDR_MASK)
+
+        e3 := *((pdpt + u64(i3 * 8)) as *raw u64)
+        if (e3 & u64(VMM_PAGE_PRESENT)) == u64(0) { << false }
+        pd := e3 & u64(VMM_ADDR_MASK)
+
+        e2 := *((pd + u64(i2 * 8)) as *raw u64)
+        if (e2 & u64(VMM_PAGE_PRESENT)) == u64(0) { << false }
+        if (e2 & u64(VMM_PAGE_HUGE)) != u64(0) { << false }
+        pt := e2 & u64(VMM_ADDR_MASK)
+
+        pte := (pt + u64(i1 * 8)) as *raw u64
+        if (*pte & u64(VMM_PAGE_PRESENT)) == u64(0) { << false }
+        *pte = u64(0)
+        arch.invlpg(virt)
+        (*st).active_mapped_pages -= 1
+        << true
+    }
+}
+
+pub fn vmm_translate(pml4 u64, virt u64) u64 {
+    i4 := int((virt >> u64(39)) & u64(0x1FF))
+    i3 := int((virt >> u64(30)) & u64(0x1FF))
+    i2 := int((virt >> u64(21)) & u64(0x1FF))
+    i1 := int((virt >> u64(12)) & u64(0x1FF))
+
+    unsafe {
+        st := vmm_state()
+        guard := (*st).lock.acquire()
+
+        e4 := *((pml4 + u64(i4 * 8)) as *raw u64)
+        if (e4 & u64(VMM_PAGE_PRESENT)) == u64(0) { << u64(0) }
+        pdpt := e4 & u64(VMM_ADDR_MASK)
+
+        e3 := *((pdpt + u64(i3 * 8)) as *raw u64)
+        if (e3 & u64(VMM_PAGE_PRESENT)) == u64(0) { << u64(0) }
+        pd := e3 & u64(VMM_ADDR_MASK)
+
+        e2 := *((pd + u64(i2 * 8)) as *raw u64)
+        if (e2 & u64(VMM_PAGE_PRESENT)) == u64(0) { << u64(0) }
+        if (e2 & u64(VMM_PAGE_HUGE)) != u64(0) {
+            << (e2 & u64(VMM_HUGE_MASK)) | (virt & u64(0x1FFFFF))
+        }
+        pt := e2 & u64(VMM_ADDR_MASK)
+
+        e1 := *((pt + u64(i1 * 8)) as *raw u64)
+        if (e1 & u64(VMM_PAGE_PRESENT)) == u64(0) { << u64(0) }
+        << (e1 & u64(VMM_ADDR_MASK)) | (virt & u64(0xFFF))
+    }
+}
+
+pub fn vmm_self_test() bool {
+    pml4 := vmm_kernel_pml4()
+    frame := pmm_alloc_frame()
+    if frame == u64(0) {
+        << false
+    }
+
+    // 256 GiB + 64 KiB (canonical lower-half virtual address outside 128 MiB identity map)
+    test_va := u64(0x0000004000010000)
+    if !vmm_map_page(pml4, test_va, frame, u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE)) {
+        pmm_free_frame(frame)
+        << false
+    }
+
+    if vmm_translate(pml4, test_va) != frame {
+        vmm_unmap_page(pml4, test_va)
+        pmm_free_frame(frame)
+        << false
+    }
+
+    $ok := true
+    unsafe {
+        vp := test_va as *raw u64
+        pp := frame as *raw u64
+        *vp = u64(0x1122334455667788)
+        if *pp != u64(0x1122334455667788) {
+            ok = false
+        }
+        *pp = u64(0x4AFEBABEDEADBEEF)
+        if *vp != u64(0x4AFEBABEDEADBEEF) {
+            ok = false
+        }
+    }
+
+    if !vmm_unmap_page(pml4, test_va) {
+        ok = false
+    }
+    if vmm_translate(pml4, test_va) != u64(0) {
+        ok = false
+    }
+    pmm_free_frame(frame)
+    << ok
+}
+
+pub fn vmm_handle_demand_pf(cr2 u64, err u64) bool {
+    // Handle only not-present faults (bit 0 == 0) inside the kernel demand window
+    if (err & u64(1)) != u64(0) {
+        << false
+    }
+    if cr2 < DEMAND_VA_BASE || cr2 >= DEMAND_VA_LIMIT {
+        << false
+    }
+    page_va := cr2 - (cr2 & u64(0xFFF))
+    frame := pmm_alloc_frame()
+    if frame == u64(0) {
+        << false
+    }
+    flags := u64(VMM_PAGE_PRESENT | VMM_PAGE_WRITABLE) | vmm_nx_bit()
+    if !vmm_map_page(vmm_kernel_pml4(), page_va, frame, flags) {
+        pmm_free_frame(frame)
+        << false
+    }
+    unsafe {
+        st := vmm_state()
+        (*st).demand_faults += u64(1)
+    }
+    << true
+}
+
+pub fn vmm_demand_pf_self_test() bool {
+    pml4 := vmm_kernel_pml4()
+    va1 := DEMAND_VA_BASE + u64(0x2000)
+    va2 := DEMAND_VA_BASE + u64(0x5000)
+    if vmm_translate(pml4, va1) != u64(0) || vmm_translate(pml4, va2) != u64(0) {
+        << false
+    }
+
+    $df_before := u64(0)
+    unsafe {
+        st := vmm_state()
+        df_before = (*st).demand_faults
+    }
+
+    $ok := true
+    unsafe {
+        // Trigger two genuine hardware #PF traps that demand-allocate 4K pages
+        p1 := va1 as *raw u64
+        p2 := va2 as *raw u64
+        *p1 = 0xDEAD111122223333u64
+        *p2 = 0xBEEF444455556666u64
+        if *p1 != 0xDEAD111122223333u64 || *p2 != 0xBEEF444455556666u64 {
+            ok = false
+        }
+        st := vmm_state()
+        if (*st).demand_faults != df_before + u64(2) {
+            ok = false
+        }
+    }
+
+    pa1 := vmm_translate(pml4, va1)
+    pa2 := vmm_translate(pml4, va2)
+    if pa1 == u64(0) || pa2 == u64(0) || pa1 == pa2 {
+        ok = false
+    }
+    if !vmm_unmap_page(pml4, va1) { ok = false }
+    if !vmm_unmap_page(pml4, va2) { ok = false }
+    if pa1 != u64(0) { pmm_free_frame(pa1) }
+    if pa2 != u64(0) { pmm_free_frame(pa2) }
+    << ok
+}

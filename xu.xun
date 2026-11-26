@@ -1,0 +1,4 @@
+module: os_test
+version: !ver 0.1.0
+xu: !ver 0.14.0
+profile: freestanding

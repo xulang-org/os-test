@@ -1,0 +1,247 @@
+@main
+$freestanding
+
+#core/mem
+#core/sync
+
+const HEAP_MAGIC = 0x4845415058554F53
+const HEAP_HDR_SIZE = sizeof(HeapBlock)
+
+@repr("C")
+pub struct HeapBlock {
+    pub magic u64
+    pub size u64
+    pub is_free u64
+    pub next u64
+    pub prev u64
+    pub pad u64
+}
+
+static_assert(HEAP_HDR_SIZE == 48 && alignof(HeapBlock) == 8, "HeapBlock ABI mismatch")
+
+@repr("C")
+pub struct HeapState {
+    pub base u64
+    pub size u64
+    pub head_addr u64
+    pub total_allocs u64
+    pub total_frees u64
+    pub bytes_used u64
+    pub bytes_free u64
+    pub block_count int
+    pub lock sync.IrqSpinlock
+}
+
+static $g_heap_state HeapState
+
+pub fn heap_state() *raw HeapState {
+    unsafe {
+        << ($&g_heap_state) as *raw HeapState
+    }
+}
+
+pub fn heap_init(pages int) bool {
+    unsafe {
+        mem.memset((($&g_heap_state) as *raw HeapState) as *raw u8, u8(0), sizeof(HeapState))
+    }
+    base := pmm_alloc_contiguous(pages)
+    if base == u64(0) {
+        << false
+    }
+
+    total_bytes := u64(pages * 4096)
+    usable := total_bytes - u64(HEAP_HDR_SIZE)
+
+    unsafe {
+        blk := base as *raw HeapBlock
+        *blk = HeapBlock{
+            magic: u64(HEAP_MAGIC),
+            size: usable,
+            is_free: u64(1),
+            next: u64(0),
+            prev: u64(0),
+            pad: u64(0)
+        }
+
+        st := heap_state()
+        *st = HeapState{
+            base: base,
+            size: total_bytes,
+            head_addr: base,
+            total_allocs: u64(0),
+            total_frees: u64(0),
+            bytes_used: u64(0),
+            bytes_free: usable,
+            block_count: 1,
+            lock: sync.irq_spinlock_new()
+        }
+    }
+    << true
+}
+
+pub fn kmalloc(size int) *raw u8 {
+    if size <= 0 {
+        << 0 as *raw u8
+    }
+    $req := ((size + 15) / 16) * 16
+    if req < 16 {
+        req = 16
+    }
+
+    unsafe {
+        st := heap_state()
+        guard := (*st).lock.acquire()
+
+        $cur := (*st).head_addr
+        while cur != u64(0) {
+            blk := cur as *raw HeapBlock
+            if (*blk).magic != u64(HEAP_MAGIC) {
+                << 0 as *raw u8
+            }
+            blk_sz := int((*blk).size)
+            if (*blk).is_free == u64(1) && blk_sz >= req {
+                rem := blk_sz - req
+                if rem >= HEAP_HDR_SIZE + 16 {
+                    new_addr := cur + u64(HEAP_HDR_SIZE + req)
+                    new_sz := u64(rem - HEAP_HDR_SIZE)
+                    old_next := (*blk).next
+
+                    new_blk := new_addr as *raw HeapBlock
+                    *new_blk = HeapBlock{
+                        magic: u64(HEAP_MAGIC),
+                        size: new_sz,
+                        is_free: u64(1),
+                        next: old_next,
+                        prev: cur,
+                        pad: u64(0)
+                    }
+
+                    if old_next != u64(0) {
+                        next_blk := old_next as *raw HeapBlock
+                        (*next_blk).prev = new_addr
+                    }
+
+                    (*blk).size = u64(req)
+                    (*blk).next = new_addr
+                    (*st).block_count += 1
+                    (*st).bytes_free = (*st).bytes_free - u64(HEAP_HDR_SIZE)
+                }
+
+                (*blk).is_free = u64(0)
+                (*st).total_allocs += u64(1)
+                (*st).bytes_used += (*blk).size
+                (*st).bytes_free = (*st).bytes_free - (*blk).size
+                << (cur + u64(HEAP_HDR_SIZE)) as *raw u8
+            }
+            cur = (*blk).next
+        }
+    }
+    << 0 as *raw u8
+}
+
+pub fn kfree(ptr *raw u8) {
+    if ptr == 0 as *raw u8 {
+        <<
+    }
+    $blk_addr := (ptr as u64) - u64(HEAP_HDR_SIZE)
+
+    unsafe {
+        st := heap_state()
+        guard := (*st).lock.acquire()
+
+        blk := blk_addr as *raw HeapBlock
+        if (*blk).magic != u64(HEAP_MAGIC) || (*blk).is_free != u64(0) {
+            <<
+        }
+
+        (*blk).is_free = u64(1)
+        (*st).total_frees += u64(1)
+        (*st).bytes_used = (*st).bytes_used - (*blk).size
+        (*st).bytes_free += (*blk).size
+
+        // Coalesce with next block if free
+        nxt_addr := (*blk).next
+        if nxt_addr != u64(0) {
+            nxt := nxt_addr as *raw HeapBlock
+            if (*nxt).magic == u64(HEAP_MAGIC) && (*nxt).is_free == u64(1) {
+                (*blk).size += u64(HEAP_HDR_SIZE) + (*nxt).size
+                after := (*nxt).next
+                (*blk).next = after
+                if after != u64(0) {
+                    after_blk := after as *raw HeapBlock
+                    (*after_blk).prev = blk_addr
+                }
+                (*nxt).magic = u64(0)
+                (*st).block_count -= 1
+                (*st).bytes_free += u64(HEAP_HDR_SIZE)
+            }
+        }
+
+        // Coalesce with previous block if free
+        prv_addr := (*blk).prev
+        if prv_addr != u64(0) {
+            prv := prv_addr as *raw HeapBlock
+            if (*prv).magic == u64(HEAP_MAGIC) && (*prv).is_free == u64(1) {
+                (*prv).size += u64(HEAP_HDR_SIZE) + (*blk).size
+                after := (*blk).next
+                (*prv).next = after
+                if after != u64(0) {
+                    after_blk := after as *raw HeapBlock
+                    (*after_blk).prev = prv_addr
+                }
+                (*blk).magic = u64(0)
+                (*st).block_count -= 1
+                (*st).bytes_free += u64(HEAP_HDR_SIZE)
+            }
+        }
+    }
+}
+
+pub fn heap_self_test() bool {
+    $used_before := u64(0)
+    $blocks_before := 0
+    unsafe {
+        st := heap_state()
+        used_before = (*st).bytes_used
+        blocks_before = (*st).block_count
+    }
+
+    p1 := kmalloc(32)
+    p2 := kmalloc(128)
+    p3 := kmalloc(256)
+    p4 := kmalloc(64)
+
+    if p1 == 0 as *raw u8 || p2 == 0 as *raw u8 || p3 == 0 as *raw u8 || p4 == 0 as *raw u8 {
+        << false
+    }
+
+    $ok := true
+    unsafe {
+        *(p1 as *raw u64) = u64(0x1111111111111111)
+        *(p2 as *raw u64) = u64(0x2222222222222222)
+        *(p3 as *raw u64) = u64(0x3333333333333333)
+        *(p4 as *raw u64) = u64(0x4444444444444444)
+
+        if *(p1 as *raw u64) != u64(0x1111111111111111) { ok = false }
+        if *(p2 as *raw u64) != u64(0x2222222222222222) { ok = false }
+        if *(p3 as *raw u64) != u64(0x3333333333333333) { ok = false }
+        if *(p4 as *raw u64) != u64(0x4444444444444444) { ok = false }
+    }
+
+    // Free out-of-order to verify bidirectional coalescing
+    kfree(p2)
+    kfree(p1)
+    kfree(p4)
+    kfree(p3)
+
+    unsafe {
+        st := heap_state()
+        if (*st).bytes_used != used_before {
+            ok = false
+        }
+        if (*st).block_count != blocks_before {
+            ok = false
+        }
+    }
+    << ok
+}

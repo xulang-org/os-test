@@ -1,0 +1,257 @@
+@main
+$freestanding
+
+#core/mem
+#core/sync
+
+pub const PAGE_SIZE = 4096
+const PMM_BITMAP_BYTES = 4096
+const PMM_MAX_FRAMES = 32768
+const PMM_RESERVED_FRAMES = 4096 // 0x0000_0000 .. 0x0100_0000 (16 MiB)
+
+@repr("C")
+pub struct PmmState {
+    pub mem_bytes u64
+    pub total_frames int
+    pub free_frames int
+    pub used_frames int
+    pub reserved_frames int
+    pub next_hint int
+    pub lock sync.IrqSpinlock
+}
+
+static $g_pmm_state PmmState
+
+@align(64)
+static $pmm_bitmap [PMM_BITMAP_BYTES]u8
+
+pub fn pmm_state() *raw PmmState {
+    unsafe {
+        << ($&g_pmm_state) as *raw PmmState
+    }
+}
+
+fn bitmap_byte(idx int) *raw u8 {
+    unsafe {
+        base := (($&pmm_bitmap[0]) as *raw u8) as usize
+        << (base + usize(idx)) as *raw u8
+    }
+}
+
+fn pmm_test_bit(frame int) bool {
+    unsafe {
+        b := *bitmap_byte(frame >> 3)
+        << (int(b) & (1 << (frame & 7))) != 0
+    }
+}
+
+fn pmm_set_bit(frame int) {
+    unsafe {
+        p := bitmap_byte(frame >> 3)
+        *p = u8(int(*p) | (1 << (frame & 7)))
+    }
+}
+
+fn pmm_clear_bit(frame int) {
+    unsafe {
+        p := bitmap_byte(frame >> 3)
+        *p = u8(int(*p) & (255 ^ (1 << (frame & 7))))
+    }
+}
+
+pub fn pmm_init() {
+    unsafe {
+        mem.memset((($&g_pmm_state) as *raw PmmState) as *raw u8, u8(0), sizeof(PmmState))
+        mem.memset(($&pmm_bitmap[0]) as *raw u8, u8(0xFF), PMM_BITMAP_BYTES)
+        bi := boot_info()
+        total_kb := int((*bi).mem_upper_kb) + 1024
+        $frames := total_kb / 4
+        if frames < 4096 {
+            frames = 4096
+        }
+        if frames > PMM_MAX_FRAMES {
+            frames = PMM_MAX_FRAMES
+        }
+
+        $f := PMM_RESERVED_FRAMES
+        while f < frames {
+            pmm_clear_bit(f)
+            f += 1
+        }
+
+        st := pmm_state()
+        *st = PmmState{
+            mem_bytes: u64(frames) * u64(PAGE_SIZE),
+            total_frames: frames,
+            free_frames: frames - PMM_RESERVED_FRAMES,
+            used_frames: PMM_RESERVED_FRAMES,
+            reserved_frames: PMM_RESERVED_FRAMES,
+            next_hint: PMM_RESERVED_FRAMES,
+            lock: sync.irq_spinlock_new()
+        }
+    }
+}
+
+pub fn pmm_free_frames() int {
+    unsafe {
+        st := pmm_state()
+        guard := (*st).lock.acquire()
+        << (*st).free_frames
+    }
+}
+
+pub fn pmm_alloc_frame() u64 {
+    $addr := u64(0)
+    unsafe {
+        st := pmm_state()
+        guard := (*st).lock.acquire()
+        total := (*st).total_frames
+        $checked := 0
+        $f := (*st).next_hint
+        if f < PMM_RESERVED_FRAMES || f >= total {
+            f = PMM_RESERVED_FRAMES
+        }
+        while checked < total - PMM_RESERVED_FRAMES {
+            if (f & 7) == 0 && f + 8 <= total {
+                b := *bitmap_byte(f >> 3)
+                if b == u8(0xFF) {
+                    f += 8
+                    checked += 8
+                    if f >= total {
+                        f = PMM_RESERVED_FRAMES
+                    }
+                    ->
+                }
+            }
+            if !pmm_test_bit(f) {
+                pmm_set_bit(f)
+                (*st).free_frames -= 1
+                (*st).used_frames += 1
+                $nh := f + 1
+                if nh >= total {
+                    nh = PMM_RESERVED_FRAMES
+                }
+                (*st).next_hint = nh
+                addr = u64(f) * u64(PAGE_SIZE)
+                <-
+            }
+            f += 1
+            checked += 1
+            if f >= total {
+                f = PMM_RESERVED_FRAMES
+            }
+        }
+    }
+    if addr != u64(0) {
+        mem.memset(addr as *raw u8, u8(0), PAGE_SIZE)
+    }
+    << addr
+}
+
+pub fn pmm_alloc_contiguous(count int) u64 {
+    if count <= 0 {
+        << u64(0)
+    }
+    if count == 1 {
+        << pmm_alloc_frame()
+    }
+    $addr := u64(0)
+    unsafe {
+        st := pmm_state()
+        guard := (*st).lock.acquire()
+        total := (*st).total_frames
+        $run_start := PMM_RESERVED_FRAMES
+        $run_len := 0
+        $f := PMM_RESERVED_FRAMES
+        while f < total {
+            if !pmm_test_bit(f) {
+                if run_len == 0 {
+                    run_start = f
+                }
+                run_len += 1
+                if run_len == count {
+                    $k := 0
+                    while k < count {
+                        pmm_set_bit(run_start + k)
+                        k += 1
+                    }
+                    (*st).free_frames -= count
+                    (*st).used_frames += count
+                    addr = u64(run_start) * u64(PAGE_SIZE)
+                    <-
+                }
+            } else {
+                run_len = 0
+            }
+            f += 1
+        }
+    }
+    if addr != u64(0) {
+        mem.memset(addr as *raw u8, u8(0), count * PAGE_SIZE)
+    }
+    << addr
+}
+
+pub fn pmm_free_frame(addr u64) {
+    if (addr & u64(PAGE_SIZE - 1)) != u64(0) {
+        <<
+    }
+    frame := int(addr >> u64(12))
+    unsafe {
+        st := pmm_state()
+        guard := (*st).lock.acquire()
+        if frame < PMM_RESERVED_FRAMES || frame >= (*st).total_frames {
+            <<
+        }
+        if pmm_test_bit(frame) {
+            pmm_clear_bit(frame)
+            (*st).free_frames += 1
+            (*st).used_frames -= 1
+            if frame < (*st).next_hint {
+                (*st).next_hint = frame
+            }
+        }
+    }
+}
+
+pub fn pmm_free_contiguous(addr u64, count int) {
+    $i := 0
+    while i < count {
+        pmm_free_frame(addr + u64(i * PAGE_SIZE))
+        i += 1
+    }
+}
+
+pub fn pmm_self_test() bool {
+    before := pmm_free_frames()
+    f1 := pmm_alloc_frame()
+    f2 := pmm_alloc_frame()
+    blk := pmm_alloc_contiguous(4)
+
+    if f1 == u64(0) || f2 == u64(0) || blk == u64(0) {
+        << false
+    }
+    if f1 == f2 || f1 < u64(0x00800000) || f2 < u64(0x00800000) || blk < u64(0x00800000) {
+        << false
+    }
+    if pmm_free_frames() != before - 6 {
+        << false
+    }
+
+    unsafe {
+        p := f1 as *raw u64
+        *p = u64(0x5A5AA5A5F0F00F0F)
+        if *p != u64(0x5A5AA5A5F0F00F0F) {
+            << false
+        }
+    }
+
+    pmm_free_frame(f1)
+    pmm_free_frame(f2)
+    pmm_free_contiguous(blk, 4)
+
+    if pmm_free_frames() != before {
+        << false
+    }
+    << true
+}

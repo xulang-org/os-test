@@ -1,0 +1,481 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/sync
+
+const PS2_DATA = 0x60
+const PS2_STATUS = 0x64
+const PS2_CMD = 0x64
+const KBD_RING_SIZE = 128
+const EV_RING_SIZE = 256
+
+const VMMOUSE_VERSION_ID = 0x3442554A
+const VMMOUSE_MAGIC = 0x564D5868
+const VMMOUSE_CMD_GETVERSION = 10
+const VMMOUSE_CMD_ABSPOINTER_DATA = 39
+const VMMOUSE_CMD_ABSPOINTER_STATUS = 40
+const VMMOUSE_CMD_ABSPOINTER_COMMAND = 41
+const VMMOUSE_SUB_READ_ID = 0x45414552
+const VMMOUSE_SUB_REQ_ABS = 0x53424152
+
+extern "C" {
+    fn vmmouse_cmd_asm(cmd u32, arg u32, out_eax *raw u32, out_ebx *raw u32, out_ecx *raw u32, out_edx *raw u32)
+}
+
+@repr("C")
+pub struct InputEventRec {
+    pub kind i32
+    pub x i32
+    pub y i32
+    pub val i32
+}
+
+// Scancode Set 1 -> ASCII lookup (unshifted)
+static scancode_normal [128]u8 = [
+    0,  27, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 45, 61,  8,  9,  // 0x00..0x0F
+    113,119,101,114,116,121,117,105,111,112,91, 93, 10,  0, 97,115,  // 0x10..0x1F
+    100,102,103,104,106,107,108,59, 39, 96,  0, 92,122,120, 99,118,  // 0x20..0x2F
+    98,110,109, 44, 46, 47,  0, 42,  0, 32,  0,  0,  0,  0,  0,  0,   // 0x30..0x3F
+    0,   0,  0,  0,  0,  0,  0, 55, 56, 57, 45, 52, 53, 54, 43, 49,  // 0x40..0x4F
+    50, 51, 48, 46,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x50..0x5F
+    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x60..0x6F
+    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0    // 0x70..0x7F
+]
+
+// Scancode Set 1 -> ASCII lookup (shifted)
+static scancode_shift [128]u8 = [
+    0,  27, 33, 64, 35, 36, 37, 94, 38, 42, 40, 41, 95, 43,  8,  9,  // 0x00..0x0F
+    81, 87, 69, 82, 84, 89, 85, 73, 79, 80,123,125, 10,  0, 65, 83,  // 0x10..0x1F
+    68, 70, 71, 72, 74, 75, 76, 58, 34,126,  0,124, 90, 88, 67, 86,  // 0x20..0x2F
+    66, 78, 77, 60, 62, 63,  0, 42,  0, 32,  0,  0,  0,  0,  0,  0,   // 0x30..0x3F
+    0,   0,  0,  0,  0,  0,  0, 55, 56, 57, 45, 52, 53, 54, 43, 49,  // 0x40..0x4F
+    50, 51, 48, 46,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x50..0x5F
+    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   // 0x60..0x6F
+    0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0    // 0x70..0x7F
+]
+
+@repr("C")
+pub struct InputState {
+    pub kbd_head int
+    pub kbd_tail int
+    pub shift_down int
+    pub caps_lock int
+    pub mouse_x int
+    pub mouse_y int
+    pub mouse_buttons int
+    pub prev_buttons int
+    pub mouse_cycle int
+    pub mouse_dirty int
+    pub click_pending int
+    pub click_x int
+    pub click_y int
+    pub vmmouse_active int
+    pub kbd_irqs u64
+    pub mouse_irqs u64
+    pub ev_head int
+    pub ev_tail int
+    pub mouse_pkt [4]u8
+    pub lock sync.IrqSpinlock
+}
+
+static $g_input_state InputState
+static $kbd_ring [KBD_RING_SIZE]u8
+static $ev_ring [EV_RING_SIZE]InputEventRec
+
+fn ev_push_irq(kind i32, x i32, y i32, val i32) {
+    unsafe {
+        st := input_state()
+        head := (*st).ev_head
+        tail := (*st).ev_tail
+        // Coalesce consecutive mouse move events (kind == 1) so the ring never drops clicks/keys
+        if kind == i32(1) && head != tail {
+            prev := (head - 1) & (EV_RING_SIZE - 1)
+            if ev_ring[prev].kind == i32(1) {
+                ev_ring[prev] = InputEventRec{kind: kind, x: x, y: y, val: val}
+                <<
+            }
+        }
+        next_head := (head + 1) & (EV_RING_SIZE - 1)
+        if next_head != tail {
+            ev_ring[head] = InputEventRec{kind: kind, x: x, y: y, val: val}
+            (*st).ev_head = next_head
+        }
+    }
+}
+
+fn input_state() *raw InputState {
+    unsafe {
+        << ($&g_input_state) as *raw InputState
+    }
+}
+
+fn ps2_wait_write() {
+    unsafe {
+        $i := 0
+        while i < 100000 {
+            if (arch.in8(u16(PS2_STATUS)) & u8(0x02)) == u8(0) {
+                <<
+            }
+            i += 1
+        }
+    }
+}
+
+fn ps2_wait_read() bool {
+    unsafe {
+        $i := 0
+        while i < 100000 {
+            if (arch.in8(u16(PS2_STATUS)) & u8(0x01)) != u8(0) {
+                << true
+            }
+            i += 1
+        }
+    }
+    << false
+}
+
+fn ps2_drain() {
+    unsafe {
+        $i := 0
+        while i < 64 {
+            if (arch.in8(u16(PS2_STATUS)) & u8(0x01)) == u8(0) {
+                <<
+            }
+            arch.in8(u16(PS2_DATA))
+            i += 1
+        }
+    }
+}
+
+fn ps2_mouse_write(cmd u8) {
+    ps2_wait_write()
+    unsafe {
+        arch.out8(u16(PS2_CMD), u8(0xD4))
+    }
+    ps2_wait_write()
+    unsafe {
+        arch.out8(u16(PS2_DATA), cmd)
+    }
+    if ps2_wait_read() {
+        unsafe { arch.in8(u16(PS2_DATA)) }
+    }
+}
+
+pub fn input_init() {
+    unsafe {
+        mem.memset((($&g_input_state) as *raw InputState) as *raw u8, u8(0), sizeof(InputState))
+        mem.memset(($&kbd_ring[0]) as *raw u8, u8(0), sizeof([KBD_RING_SIZE]u8))
+        st := input_state()
+        (*st).mouse_x = 512
+        (*st).mouse_y = 384
+        (*st).mouse_dirty = 1
+        (*st).lock = sync.irq_spinlock_new()
+    }
+
+    ps2_drain()
+
+    // Enable auxiliary PS/2 mouse port
+    ps2_wait_write()
+    unsafe { arch.out8(u16(PS2_CMD), u8(0xA8)) }
+
+    // Read controller config, enable IRQ1 (bit 0) + IRQ12 (bit 1), clear mouse clock disable (bit 5)
+    ps2_wait_write()
+    unsafe { arch.out8(u16(PS2_CMD), u8(0x20)) }
+    if ps2_wait_read() {
+        unsafe {
+            cfg := (arch.in8(u16(PS2_DATA)) | u8(0x03)) & u8(0xDF)
+            ps2_wait_write()
+            arch.out8(u16(PS2_CMD), u8(0x60))
+            ps2_wait_write()
+            arch.out8(u16(PS2_DATA), cfg)
+        }
+    }
+
+    // Set defaults & enable packet streaming on PS/2 mouse
+    ps2_mouse_write(u8(0xF6))
+    ps2_mouse_write(u8(0xF4))
+    ps2_drain()
+    if vmmouse_init() {
+        serial_puts("[BOOT] QEMU vmmouse absolute pointer active.\n")
+    }
+}
+
+fn vmmouse_init() bool {
+    unsafe {
+        $ea := u32(0)
+        $eb := u32(0)
+        $ec := u32(0)
+        $ed := u32(0)
+        vmmouse_cmd_asm(u32(VMMOUSE_CMD_GETVERSION), u32(0), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+        if eb != u32(VMMOUSE_MAGIC) || ea == u32(0xFFFFFFFF) {
+            serial_puts("[BOOT] vmmouse GETVERSION fail ea=")
+            serial_put_hex(u64(ea))
+            serial_puts(" eb=")
+            serial_put_hex(u64(eb))
+            serial_puts("\n")
+            << false
+        }
+        vmmouse_cmd_asm(u32(VMMOUSE_CMD_ABSPOINTER_COMMAND), u32(VMMOUSE_SUB_READ_ID), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+        vmmouse_cmd_asm(u32(VMMOUSE_CMD_ABSPOINTER_DATA), u32(1), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+        if ea != u32(VMMOUSE_VERSION_ID) {
+            serial_puts("[BOOT] vmmouse READ_ID fail ea=")
+            serial_put_hex(u64(ea))
+            serial_puts("\n")
+            << false
+        }
+        vmmouse_cmd_asm(u32(VMMOUSE_CMD_ABSPOINTER_COMMAND), u32(VMMOUSE_SUB_REQ_ABS), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+        st := input_state()
+        (*st).vmmouse_active = 1
+        << true
+    }
+}
+
+fn mouse_commit_state(st *raw InputState, raw_nx int, raw_ny int, btns int) {
+    $nx := raw_nx
+    $ny := raw_ny
+    if nx < 0 { nx = 0 }
+    if nx >= FB_WIDTH { nx = FB_WIDTH - 1 }
+    if ny < 0 { ny = 0 }
+    if ny >= FB_HEIGHT { ny = FB_HEIGHT - 1 }
+    unsafe {
+        moved := (nx != (*st).mouse_x) || (ny != (*st).mouse_y)
+        (*st).mouse_x = nx
+        (*st).mouse_y = ny
+
+        prev := (*st).prev_buttons
+        (*st).prev_buttons = btns
+        (*st).mouse_buttons = btns
+        if (btns & 1) != 0 && (prev & 1) == 0 {
+            (*st).click_pending = 1
+            (*st).click_x = nx
+            (*st).click_y = ny
+        }
+        if moved {
+            ev_push_irq(i32(1), i32(nx), i32(ny), i32(btns))
+        }
+        if (btns & 1) != 0 && (prev & 1) == 0 {
+            ev_push_irq(i32(2), i32(nx), i32(ny), i32(btns))
+        } else if (btns & 1) == 0 && (prev & 1) != 0 {
+            ev_push_irq(i32(3), i32(nx), i32(ny), i32(btns))
+        }
+        if (btns & 2) != 0 && (prev & 2) == 0 {
+            ev_push_irq(i32(4), i32(nx), i32(ny), i32(btns))
+        } else if (btns & 2) == 0 && (prev & 2) != 0 {
+            ev_push_irq(i32(5), i32(nx), i32(ny), i32(btns))
+        }
+        (*st).mouse_dirty = 1
+    }
+}
+
+// Called only from IRQ1 trap_handler (IF=0). Must NOT acquire IrqSpinlock.
+pub fn input_on_kbd_irq() {
+    unsafe {
+        st := input_state()
+        $iters := 0
+        while iters < 32 {
+            st_reg := arch.in8(u16(PS2_STATUS))
+            if (st_reg & u8(0x21)) != u8(0x01) {
+                <-
+            }
+            iters += 1
+            sc := int(arch.in8(u16(PS2_DATA)))
+            (*st).kbd_irqs += u64(1)
+
+            if sc == 0x2A || sc == 0x36 {
+                (*st).shift_down = 1
+                ->
+            }
+            if sc == 0xAA || sc == 0xB6 {
+                (*st).shift_down = 0
+                ->
+            }
+            if sc == 0x3A {
+                if (*st).caps_lock == 0 { (*st).caps_lock = 1 } else { (*st).caps_lock = 0 }
+                ->
+            }
+            if sc >= 0x80 {
+                ->
+            }
+
+            $ch := scancode_normal[sc]
+            if (*st).shift_down != 0 {
+                ch = scancode_shift[sc]
+            } else if (*st).caps_lock != 0 && ch >= u8(97) && ch <= u8(122) {
+                ch = u8(int(ch) - 32)
+            }
+            if ch == u8(0) {
+                ->
+            }
+            head := (*st).kbd_head
+            tail := (*st).kbd_tail
+            next_head := (head + 1) & (KBD_RING_SIZE - 1)
+            if next_head != tail {
+                kbd_ring[head] = ch
+                (*st).kbd_head = next_head
+            }
+            ev_push_irq(i32(6), i32((*st).mouse_x), i32((*st).mouse_y), i32(ch))
+        }
+    }
+}
+
+// Called only from IRQ12 trap_handler (IF=0). Must NOT acquire IrqSpinlock.
+pub fn input_on_mouse_irq() {
+    unsafe {
+        st := input_state()
+        $iters := 0
+        while iters < 64 {
+            st_reg := arch.in8(u16(PS2_STATUS))
+            if (st_reg & u8(0x21)) != u8(0x21) {
+                <-
+            }
+            iters += 1
+            b := arch.in8(u16(PS2_DATA))
+            (*st).mouse_irqs += u64(1)
+            if (*st).vmmouse_active != 0 {
+                ->
+            }
+
+            $cyc := (*st).mouse_cycle
+            if cyc == 0 && (b & u8(0x08)) == u8(0) {
+                ->
+            }
+            g_input_state.mouse_pkt[cyc] = b
+            cyc += 1
+            if cyc < 3 {
+                (*st).mouse_cycle = cyc
+                ->
+            }
+            (*st).mouse_cycle = 0
+
+            b0 := int(g_input_state.mouse_pkt[0])
+            $dx := int(g_input_state.mouse_pkt[1])
+            $dy := int(g_input_state.mouse_pkt[2])
+            if (b0 & 0xC0) != 0 {
+                dx = 0
+                dy = 0
+            } else {
+                if (b0 & 0x10) != 0 { dx = dx - 256 }
+                if (b0 & 0x20) != 0 { dy = dy - 256 }
+            }
+            mouse_commit_state(st, (*st).mouse_x + dx, (*st).mouse_y - dy, b0 & 7)
+        }
+
+        if (*st).vmmouse_active != 0 {
+            $ea := u32(0)
+            $eb := u32(0)
+            $ec := u32(0)
+            $ed := u32(0)
+            $vi := 0
+            while vi < 32 {
+                vmmouse_cmd_asm(u32(VMMOUSE_CMD_ABSPOINTER_STATUS), u32(0), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+                if (ea & u32(0xFFFF0000)) == u32(0xFFFF0000) || (ea & u32(0xFFFF)) < u32(4) {
+                    <-
+                }
+                vmmouse_cmd_asm(u32(VMMOUSE_CMD_ABSPOINTER_DATA), u32(4), ($&ea) as *raw u32, ($&eb) as *raw u32, ($&ec) as *raw u32, ($&ed) as *raw u32)
+                nx := (int(eb & u32(0xFFFF)) * FB_WIDTH) / 65536
+                ny := (int(ec & u32(0xFFFF)) * FB_HEIGHT) / 65536
+                $btns := 0
+                if (ea & u32(0x20)) != u32(0) { btns = btns | 1 }
+                if (ea & u32(0x10)) != u32(0) { btns = btns | 2 }
+                if (ea & u32(0x08)) != u32(0) { btns = btns | 4 }
+                mouse_commit_state(st, nx, ny, btns)
+                vi += 1
+            }
+        }
+    }
+}
+
+pub fn kbd_try_getc() int {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        head := (*st).kbd_head
+        tail := (*st).kbd_tail
+        if head != tail {
+            ch := int(kbd_ring[tail])
+            (*st).kbd_tail = (tail + 1) & (KBD_RING_SIZE - 1)
+            << ch
+        }
+    }
+    << -1
+}
+
+pub fn mouse_get_x() int {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        << (*st).mouse_x
+    }
+}
+
+pub fn mouse_get_y() int {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        << (*st).mouse_y
+    }
+}
+
+pub fn mouse_get_buttons() int {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        << (*st).mouse_buttons
+    }
+}
+
+pub fn mouse_consume_click(out_x *raw int, out_y *raw int) bool {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        if (*st).click_pending != 0 {
+            (*st).click_pending = 0
+            *out_x = (*st).click_x
+            *out_y = (*st).click_y
+            << true
+        }
+    }
+    << false
+}
+
+pub fn mouse_take_dirty() bool {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        if (*st).mouse_dirty != 0 {
+            (*st).mouse_dirty = 0
+            << true
+        }
+    }
+    << false
+}
+
+pub fn input_has_events() bool {
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        << (*st).ev_head != (*st).ev_tail
+    }
+}
+
+pub fn input_read_events(out *raw u8, max_bytes int) int {
+    if out == 0 as *raw u8 || max_bytes < 16 {
+        << 0
+    }
+    $written := 0
+    unsafe {
+        st := input_state()
+        guard := (*st).lock.acquire()
+        while written + 16 <= max_bytes && (*st).ev_head != (*st).ev_tail {
+            tail := (*st).ev_tail
+            rec := ev_ring[tail]
+            dst := ((out as usize) + usize(written)) as *raw InputEventRec
+            *dst = rec
+            (*st).ev_tail = (tail + 1) & (EV_RING_SIZE - 1)
+            written += 16
+        }
+    }
+    << written
+}
