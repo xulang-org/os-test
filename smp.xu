@@ -33,6 +33,12 @@ static $g_smp_ack sync.AtomicU64
 static $g_smp_ipi_count sync.AtomicU64
 static $g_smp_ipi_cpu sync.AtomicU64
 static $g_smp_timer_count sync.AtomicU64
+static $g_ap_timer_ticks sync.AtomicU64
+static $g_tlb_shootdown_va sync.AtomicU64
+static $g_tlb_shootdown_ack sync.AtomicU64
+static $g_ap_peek_va sync.AtomicU64
+static $g_ap_peek_val sync.AtomicU64
+static $g_ap_peek_done sync.AtomicU64
 
 @interrupt
 pub fn smp_ipi82_isr() {
@@ -49,7 +55,23 @@ pub fn smp_ipi82_isr() {
 @interrupt
 pub fn smp_lapic_timer_isr() {
     unsafe {
-        g_smp_timer_count.fetch_add(u64(1))
+        if g_smp_lapic_base != u64(0) {
+            if u64(arch.lapic_id(g_smp_lapic_base)) == g_smp_ap_id.load() && g_smp_ap_online.load() != u64(0) {
+                g_ap_timer_ticks.fetch_add(u64(1))
+            } else {
+                g_smp_timer_count.fetch_add(u64(1))
+            }
+            arch.lapic_eoi(g_smp_lapic_base)
+        }
+    }
+}
+
+@interrupt
+pub fn smp_tlb_shootdown_isr() {
+    unsafe {
+        va := g_tlb_shootdown_va.load()
+        arch.invlpg(va)
+        g_tlb_shootdown_ack.fetch_add(u64(1))
         if g_smp_lapic_base != u64(0) {
             arch.lapic_eoi(g_smp_lapic_base)
         }
@@ -76,6 +98,9 @@ pub fn smp_ap_main() {
         arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), (($&g_percpu[1]) as *raw PerCpu) as u64)
         g_smp_ap_online.store(u64(1))
         arch.sti()
+        if lapic != u64(0) {
+            arch.lapic_timer_init(lapic, u8(0x83), u32(0x3), u32(400000), true)
+        }
 
         while true {
             cmd := g_smp_cmd.load()
@@ -90,6 +115,12 @@ pub fn smp_ap_main() {
                 }
                 g_smp_cmd.store(u64(0))
                 g_smp_ack.fetch_add(u64(1))
+            } else if cmd == u64(2) {
+                va := g_ap_peek_va.load()
+                val := volatile_read(va as *raw u64)
+                g_ap_peek_val.store(val)
+                g_smp_cmd.store(u64(0))
+                g_ap_peek_done.fetch_add(u64(1))
             } else {
                 arch.pause()
             }
@@ -193,6 +224,7 @@ pub fn smp_self_test() bool {
         g_smp_lapic_base = madt.lapic_addr
         idt_set_gate_pub(0x82, (smp_ipi82_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
         idt_set_gate_pub(0x83, (smp_lapic_timer_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
+        idt_set_gate_pub(0x84, (smp_tlb_shootdown_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
 
         if g_smp_ap_online.load() == u64(0) {
             t_start := ((&ap_trampoline_start) as *raw u8) as u64
@@ -307,6 +339,144 @@ pub fn smp_self_test() bool {
         serial_put_dec(int(ipi_cid))
         serial_puts(" lapic_timer=")
         serial_put_dec(int(g_smp_timer_count.load()))
+        serial_puts(" OK\n")
+    }
+    << true
+}
+
+pub fn smp_tlb_shootdown(va u64) bool {
+    unsafe {
+        arch.invlpg(va)
+        if g_smp_ap_online.load() == u64(0) || g_smp_lapic_base == u64(0) {
+            << true
+        }
+        prev := g_tlb_shootdown_ack.load()
+        g_tlb_shootdown_va.store(va)
+        arch.lapic_send_ipi(g_smp_lapic_base, u8(g_smp_ap_id.load()), u8(0x84))
+        $tries := 0
+        while g_tlb_shootdown_ack.load() <= prev && tries < 20000000 {
+            arch.pause()
+            tries += 1
+        }
+        << g_tlb_shootdown_ack.load() > prev
+    }
+}
+
+fn smp_ap_peek_u64(va u64, out *raw u64) bool {
+    unsafe {
+        prev := g_ap_peek_done.load()
+        g_ap_peek_va.store(va)
+        g_smp_cmd.store(u64(2))
+        $tries := 0
+        while g_ap_peek_done.load() <= prev && tries < 20000000 {
+            arch.pause()
+            tries += 1
+        }
+        if g_ap_peek_done.load() <= prev {
+            << false
+        }
+        *out = g_ap_peek_val.load()
+    }
+    << true
+}
+
+pub fn smp_tlb_and_acpi_self_test() bool {
+    unsafe {
+        if g_smp_ap_online.load() == u64(0) {
+            if !smp_self_test() {
+                << false
+            }
+        }
+        rsdp := acpi.find_rsdp()
+        fadt_addr := acpi.find_fadt(rsdp)
+        if fadt_addr == u64(0) {
+            serial_puts("[SMP-TLB] FAIL: ACPI FADT not found\n")
+            << false
+        }
+        $fadt := acpi.FadtInfo{
+            sci_int: u16(0), smi_cmd: u32(0), pm1a_evt_blk: u32(0),
+            pm1a_cnt_blk: u32(0), pm_tmr_blk: u32(0), flags: u32(0),
+            reset_reg_addr: u64(0), reset_value: u8(0)
+        }
+        if !acpi.parse_fadt(fadt_addr, ($&fadt) as *raw acpi.FadtInfo) {
+            serial_puts("[SMP-TLB] FAIL: parse_fadt failed\n")
+            << false
+        }
+        if fadt.pm1a_cnt_blk == u32(0) || fadt.pm_tmr_blk == u32(0) {
+            serial_puts("[SMP-TLB] FAIL: invalid FADT pm1a/pm_tmr\n")
+            << false
+        }
+        $hpet_base := u64(0)
+        hpet_addr := acpi.find_hpet(rsdp)
+        if hpet_addr != u64(0) {
+            $hpet := acpi.HpetInfo{
+                base_addr: u64(0), min_tick: u16(0), comparator_count: u8(0),
+                counter_64bit: false, vendor_id: u16(0)
+            }
+            if acpi.parse_hpet(hpet_addr, ($&hpet) as *raw acpi.HpetInfo) {
+                hpet_base = hpet.base_addr
+            }
+        }
+
+        p1 := pmm_alloc_frame()
+        p2 := pmm_alloc_frame()
+        if p1 == u64(0) || p2 == u64(0) {
+            if p1 != u64(0) { pmm_free_frame(p1) }
+            if p2 != u64(0) { pmm_free_frame(p2) }
+            serial_puts("[SMP-TLB] FAIL: pmm_alloc_frame\n")
+            << false
+        }
+        *(p1 as *raw u64) = 0x1122334455667788u64
+        *(p2 as *raw u64) = 0xCAFEBABE12345678u64
+
+        test_va := u64(0x20010000)
+        flags := u64(VMM_PAGE_WRITABLE) | vmm_nx_bit()
+        pml4 := vmm_kernel_pml4()
+        $ok := true
+        if !vmm_map_page(pml4, test_va, p1, flags) {
+            ok = false
+        }
+        $v1 := u64(0)
+        if ok && (!smp_tlb_shootdown(test_va) || !smp_ap_peek_u64(test_va, ($&v1) as *raw u64) || v1 != 0x1122334455667788u64) {
+            serial_puts("[SMP-TLB] FAIL: phase 1 AP TLB read mismatch\n")
+            ok = false
+        }
+        if ok && !vmm_map_page(pml4, test_va, p2, flags) {
+            ok = false
+        }
+        $v2 := u64(0)
+        if ok && (!smp_tlb_shootdown(test_va) || !smp_ap_peek_u64(test_va, ($&v2) as *raw u64) || v2 != 0xCAFEBABE12345678u64) {
+            serial_puts("[SMP-TLB] FAIL: phase 2 AP TLB shootdown read mismatch\n")
+            ok = false
+        }
+        vmm_unmap_page(pml4, test_va)
+        smp_tlb_shootdown(test_va)
+        pmm_free_frame(p1)
+        pmm_free_frame(p2)
+        if !ok {
+            << false
+        }
+
+        $ap_ticks := g_ap_timer_ticks.load()
+        $wait_ap := 0
+        while ap_ticks == u64(0) && wait_ap < 5000000 {
+            arch.pause()
+            ap_ticks = g_ap_timer_ticks.load()
+            wait_ap += 1
+        }
+        if ap_ticks == u64(0) {
+            serial_puts("[SMP-TLB] FAIL: AP autonomous LAPIC periodic timer did not tick\n")
+            << false
+        }
+
+        serial_puts("[SMP-TLB] fadt_pm1a=")
+        serial_put_hex(u64(fadt.pm1a_cnt_blk))
+        serial_puts(" pm_tmr=")
+        serial_put_hex(u64(fadt.pm_tmr_blk))
+        serial_puts(" hpet=")
+        serial_put_hex(hpet_base)
+        serial_puts(" shootdown=OK ap_timer_ticks=")
+        serial_put_dec(int(ap_ticks))
         serial_puts(" OK\n")
     }
     << true
