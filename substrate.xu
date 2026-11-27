@@ -1,0 +1,192 @@
+@main
+$freestanding
+
+#core/arch
+#core/mem
+#core/sync
+
+extern "C" static link_kernel_end u8 = "_kernel_end"
+
+extern "C" fn os_naked_inc_call(x u64) u64 = "os_naked_inc"
+
+@align(16)
+static $fx_area [512]u8
+
+@align(16)
+static $percpu_scratch [4]u64
+
+@weak
+@export("os_weak_hook")
+pub fn os_weak_hook() int {
+    << 123
+}
+
+@naked
+@export("os_naked_inc")
+pub fn os_naked_inc() {
+    unsafe {
+        asm(".byte 0x48, 0x8d, 0x47, 0x01; ret")
+    }
+}
+
+pub fn substrate_self_test() bool {
+    // 1. Linker script extern "C" static symbol
+    unsafe {
+        kend_sym := ((&link_kernel_end) as *raw u8) as u64
+        bi := boot_info()
+        if kend_sym == u64(0) || kend_sym != (*bi).xu_kernel_end {
+            serial_puts("[SUBSTRATE] FAIL: extern static link_kernel_end mismatch\n")
+            << false
+        }
+    }
+
+    // 2. @weak & @naked + extended asm(".byte ...; ret")
+    if os_weak_hook() != 123 {
+        serial_puts("[SUBSTRATE] FAIL: @weak hook mismatch\n")
+        << false
+    }
+    unsafe {
+        if os_naked_inc_call(u64(41)) != u64(42) {
+            serial_puts("[SUBSTRATE] FAIL: @naked asm stub mismatch\n")
+            << false
+        }
+    }
+
+    // 3. Expanded atomics (8/16/32/64-bit, bitwise RMW, explicit ordering) & TicketLock
+    $a8 := sync.atomic_u8_new(u8(10))
+    if a8.load() != u8(10) || a8.swap(u8(25)) != u8(10) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU8 swap\n")
+        << false
+    }
+    if a8.compare_exchange(u8(25), u8(77)) != u8(25) || a8.load() != u8(77) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU8 cas\n")
+        << false
+    }
+    a8.store(u8(99))
+    if a8.load() != u8(99) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU8 store/load\n")
+        << false
+    }
+
+    $a16 := sync.atomic_u16_new(u16(0x1234))
+    if a16.load() != u16(0x1234) || a16.swap(u16(0xABCD)) != u16(0x1234) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU16 swap\n")
+        << false
+    }
+    if a16.compare_exchange(u16(0xABCD), u16(0x5678)) != u16(0xABCD) || a16.load() != u16(0x5678) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU16 cas\n")
+        << false
+    }
+
+    $a32 := sync.atomic_u32_new(u32(0xFF))
+    if a32.fetch_sub(u32(0x0F)) != u32(0xFF) || a32.load_ordered(sync.ORDER_RELAXED) != u32(0xF0) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU32 fetch_sub\n")
+        << false
+    }
+    if a32.fetch_and(u32(0x3C)) != u32(0xF0) || a32.load() != u32(0x30) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU32 fetch_and\n")
+        << false
+    }
+    if a32.fetch_or(u32(0x05)) != u32(0x30) || a32.fetch_xor(u32(0xFF)) != u32(0x35) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU32 fetch_or/xor\n")
+        << false
+    }
+    a32.store_ordered(u32(0xCAFE), sync.ORDER_SEQ_CST)
+    if a32.load_ordered(sync.ORDER_SEQ_CST) != u32(0xCAFE) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU32 seq_cst\n")
+        << false
+    }
+
+    $a64 := sync.atomic_u64_new(u64(0x1000))
+    if a64.fetch_sub(u64(0x100)) != u64(0x1000) || a64.fetch_or(u64(0x55)) != u64(0xF00) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU64 sub/or\n")
+        << false
+    }
+    if a64.fetch_and(u64(0xFF)) != u64(0xF55) || a64.fetch_xor(u64(0xF0)) != u64(0x55) {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU64 and/xor\n")
+        << false
+    }
+    a64.store_ordered(0xDEADBEEF12345678u64, sync.ORDER_RELAXED)
+    if a64.load_ordered(sync.ORDER_RELAXED) != 0xDEADBEEF12345678u64 {
+        serial_puts("[SUBSTRATE] FAIL: AtomicU64 relaxed\n")
+        << false
+    }
+
+    sync.compiler_fence()
+    sync.fence(sync.ORDER_SEQ_CST)
+
+    $tlock := sync.ticket_lock_new()
+    if !tlock.try_lock() {
+        serial_puts("[SUBSTRATE] FAIL: TicketLock try_lock 1\n")
+        << false
+    }
+    if tlock.try_lock() {
+        serial_puts("[SUBSTRATE] FAIL: TicketLock try_lock 2 should fail\n")
+        << false
+    }
+    tlock.unlock()
+    if true {
+        _tg := tlock.acquire()
+    }
+    if !tlock.try_lock() {
+        serial_puts("[SUBSTRATE] FAIL: TicketGuard drop unlock\n")
+        << false
+    }
+    tlock.unlock()
+
+    // 4. FXSAVE/FXRSTOR, Per-CPU GS base, and RSP/RBP
+    unsafe {
+        p_fx := (&fx_area[0]) as *raw u8
+        mem.memset(p_fx, u8(0), 512)
+        arch.fxsave(p_fx)
+        mxcsr := *(((&fx_area[24]) as *raw u8) as *raw u32)
+        if mxcsr == u32(0) {
+            serial_puts("[SUBSTRATE] FAIL: fxsave MXCSR is 0\n")
+            << false
+        }
+        arch.fxrstor(p_fx)
+
+        flags := arch.irq_save()
+        saved_gs := arch.rdmsr(u32(arch.MSR_IA32_GS_BASE))
+        gs_ptr := ((&percpu_scratch[0]) as *raw u64) as u64
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), gs_ptr)
+        arch.gs_write_u64(u64(8), u64(0x1122334455667788))
+        got_gs := arch.gs_read_u64(u64(8))
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), saved_gs)
+        arch.irq_restore(flags)
+        if got_gs != u64(0x1122334455667788) || percpu_scratch[1] != u64(0x1122334455667788) {
+            serial_puts("[SUBSTRATE] FAIL: gs_read/write_u64 mismatch\n")
+            << false
+        }
+
+        if arch.read_rsp() == u64(0) || arch.read_rbp() == u64(0) {
+            serial_puts("[SUBSTRATE] FAIL: read_rsp/read_rbp zero\n")
+            << false
+        }
+    }
+
+    // 5. Local APIC MMIO mapping & version/id probe
+    lapic := arch.lapic_base()
+    if lapic == u64(0) {
+        serial_puts("[SUBSTRATE] FAIL: lapic_base is 0\n")
+        << false
+    }
+    lapic_flags := u64(VMM_PAGE_WRITABLE | VMM_PAGE_PCD | VMM_PAGE_PWT) | vmm_nx_bit()
+    if !vmm_map_page(vmm_kernel_pml4(), lapic, lapic, lapic_flags) {
+        serial_puts("[SUBSTRATE] FAIL: map LAPIC MMIO\n")
+        << false
+    }
+    lapic_ver := arch.lapic_version(lapic)
+    lapic_id_val := arch.lapic_id(lapic)
+    if (lapic_ver & u32(0xFF)) < u32(0x10) {
+        serial_puts("[SUBSTRATE] FAIL: invalid LAPIC version\n")
+        << false
+    }
+
+    serial_puts("[SUBSTRATE] extern_static+@weak+@naked+atomics+fxsave+gs+lapic_ver=")
+    serial_put_hex(u64(lapic_ver))
+    serial_puts(" apic_id=")
+    serial_put_dec(int(lapic_id_val))
+    serial_puts(" OK\n")
+    << true
+}

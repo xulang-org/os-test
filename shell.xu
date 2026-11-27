@@ -7,7 +7,7 @@ $freestanding
 
 const SHELL_BUF_CAP = 120
 const SHELL_RING_CAP = 256
-const NUM_SHELL_CMDS = 23
+const NUM_SHELL_CMDS = 24
 
 @repr("C")
 pub struct ShellState {
@@ -217,46 +217,46 @@ fn cmd_selftest(coop_ok bool) {
     sched_sleep(6)
     t1 := trap_ticks()
     if t1 > t0 {
-        serial_puts("[PASS] 1/15 PIT Timer IRQ 100Hz (ticks ")
+        serial_puts("[PASS] 1/16 PIT Timer IRQ 100Hz (ticks ")
         serial_put_dec(int(t0))
         serial_puts(" -> ")
         serial_put_dec(int(t1))
         serial_puts(")\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 1/15 PIT Timer IRQ did not advance\n")
+        serial_puts("[FAIL] 1/16 PIT Timer IRQ did not advance\n")
     }
 
     // 2. PMM
     if pmm_self_test() {
-        serial_puts("[PASS] 2/15 PMM Bitmap Allocator\n")
+        serial_puts("[PASS] 2/16 PMM Bitmap Allocator\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 2/15 PMM Bitmap Allocator\n")
+        serial_puts("[FAIL] 2/16 PMM Bitmap Allocator\n")
     }
 
     // 3. VMM
     if vmm_self_test() {
-        serial_puts("[PASS] 3/15 VMM 4-Level Paging (CR3/INVLPG)\n")
+        serial_puts("[PASS] 3/16 VMM 4-Level Paging (CR3/INVLPG)\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 3/15 VMM 4-Level Paging\n")
+        serial_puts("[FAIL] 3/16 VMM 4-Level Paging\n")
     }
 
     // 4. Heap
     if heap_self_test() {
-        serial_puts("[PASS] 4/15 Kernel Heap Split/Coalesce\n")
+        serial_puts("[PASS] 4/16 Kernel Heap Split/Coalesce\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 4/15 Kernel Heap Split/Coalesce\n")
+        serial_puts("[FAIL] 4/16 Kernel Heap Split/Coalesce\n")
     }
 
     // 5. Cooperative Context Switch
     if coop_ok {
-        serial_puts("[PASS] 5/15 Cooperative Context Switch (#core/task.switch_context)\n")
+        serial_puts("[PASS] 5/16 Cooperative Context Switch (#core/task.switch_context)\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 5/15 Cooperative Context Switch\n")
+        serial_puts("[FAIL] 5/16 Cooperative Context Switch\n")
     }
 
     // 6. Preemptive Multitasking
@@ -265,7 +265,7 @@ fn cmd_selftest(coop_ok bool) {
         ss := sched_state()
         ds := demo_state()
         if (*ds).worker_a_iters > u64(0) && (*ds).worker_b_iters > u64(0) && (*ss).total_switches > u64(0) {
-            serial_puts("[PASS] 6/15 Preemptive Multitasking (switches=")
+            serial_puts("[PASS] 6/16 Preemptive Multitasking (switches=")
             serial_put_dec(int((*ss).total_switches))
             serial_puts(" A=")
             serial_put_dec(int((*ds).worker_a_iters))
@@ -274,91 +274,99 @@ fn cmd_selftest(coop_ok bool) {
             serial_puts(")\n")
             passed += 1
         } else {
-            serial_puts("[FAIL] 6/15 Preemptive Multitasking\n")
+            serial_puts("[FAIL] 6/16 Preemptive Multitasking\n")
         }
 
         // 7. IrqSpinlock RAII & Shared Counter + Worker Heap Ops
         if (*ds).shared_counter > u64(0) && (*ds).worker_b_heap_ops > u64(0) {
-            serial_puts("[PASS] 7/15 IrqSpinlock RAII & Concurrent Heap (shared=")
+            serial_puts("[PASS] 7/16 IrqSpinlock RAII & Concurrent Heap (shared=")
             serial_put_dec(int((*ds).shared_counter))
             serial_puts(" heap_ops=")
             serial_put_dec(int((*ds).worker_b_heap_ops))
             serial_puts(")\n")
             passed += 1
         } else {
-            serial_puts("[FAIL] 7/15 IrqSpinlock RAII\n")
+            serial_puts("[FAIL] 7/16 IrqSpinlock RAII\n")
         }
     }
 
     // 8. Ring 3 User Mode & SYSCALL/SYSRET
     if user_self_test() {
-        serial_puts("[PASS] 8/15 Ring 3 User Mode & SYSCALL/SYSRET\n")
+        serial_puts("[PASS] 8/16 Ring 3 User Mode & SYSCALL/SYSRET\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 8/15 Ring 3 User Mode & SYSCALL/SYSRET\n")
+        serial_puts("[FAIL] 8/16 Ring 3 User Mode & SYSCALL/SYSRET\n")
     }
 
     // 9. VirtIO-Blk PCI DMA Read/Write
     if blk_self_test() {
-        serial_puts("[PASS] 9/15 VirtIO-Blk PCI DMA Read/Write\n")
+        serial_puts("[PASS] 9/16 VirtIO-Blk PCI DMA Read/Write\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 9/15 VirtIO-Blk PCI DMA Read/Write\n")
+        serial_puts("[FAIL] 9/16 VirtIO-Blk PCI DMA Read/Write\n")
     }
 
     // 10. Persistent XuFS on VirtIO-Blk
     if fs_self_test() {
-        serial_puts("[PASS] 10/15 Persistent XuFS Read/Write/Remount\n")
+        serial_puts("[PASS] 10/16 Persistent XuFS Read/Write/Remount\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 10/15 Persistent XuFS Read/Write/Remount\n")
+        serial_puts("[FAIL] 10/16 Persistent XuFS Read/Write/Remount\n")
     }
 
     // 11. Pure-Xu Ring 3 ELF64 Loader + Per-Process PML4 + W^X/NX
     if elf_self_test() {
-        serial_puts("[PASS] 11/15 Pure-Xu Ring3 ELF64 Loader (W^X + NX + Per-Process CR3)\n")
+        serial_puts("[PASS] 11/16 Pure-Xu Ring3 ELF64 Loader (W^X + NX + Per-Process CR3)\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 11/15 Pure-Xu Ring3 ELF64 Loader\n")
+        serial_puts("[FAIL] 11/16 Pure-Xu Ring3 ELF64 Loader\n")
     }
 
     // 12. Demand Paging #PF + Ring 3 Fault Containment
     if pf_self_test() {
-        serial_puts("[PASS] 12/15 Demand Paging #PF + Ring3 Fault Containment\n")
+        serial_puts("[PASS] 12/16 Demand Paging #PF + Ring3 Fault Containment\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 12/15 Demand Paging #PF + Ring3 Fault Containment\n")
+        serial_puts("[FAIL] 12/16 Demand Paging #PF + Ring3 Fault Containment\n")
     }
 
     // 13. Unmodified Linux x86_64 ELF64 App
     if linux_app_self_test() {
-        serial_puts("[PASS] 13/15 Unmodified Linux x86_64 ELF64 App\n")
+        serial_puts("[PASS] 13/16 Unmodified Linux x86_64 ELF64 App\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 13/15 Unmodified Linux x86_64 ELF64 App\n")
+        serial_puts("[FAIL] 13/16 Unmodified Linux x86_64 ELF64 App\n")
     }
 
     // 14. Unmodified macOS x86_64 Mach-O App
     if macos_app_self_test() {
-        serial_puts("[PASS] 14/15 Unmodified macOS x86_64 Mach-O App\n")
+        serial_puts("[PASS] 14/16 Unmodified macOS x86_64 Mach-O App\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 14/15 Unmodified macOS x86_64 Mach-O App\n")
+        serial_puts("[FAIL] 14/16 Unmodified macOS x86_64 Mach-O App\n")
     }
 
     // 15. Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)
     if ui_desktop_self_test() {
-        serial_puts("[PASS] 15/15 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
+        serial_puts("[PASS] 15/16 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
         passed += 1
     } else {
-        serial_puts("[FAIL] 15/15 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
+        serial_puts("[FAIL] 15/16 Ring 3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O)\n")
     }
 
-    if passed == 15 {
-        serial_puts("[SELFTEST] ALL 15 CHECKS PASSED\n")
+    // 16. Low-Level OS Substrate (@weak, @naked, extern static, atomics, fxsave, gs, LAPIC)
+    if substrate_self_test() {
+        serial_puts("[PASS] 16/16 OS Low-Level Substrate (@weak/@naked/extern static/SMP/LAPIC)\n")
+        passed += 1
+    } else {
+        serial_puts("[FAIL] 16/16 OS Low-Level Substrate\n")
+    }
+
+    if passed == 16 {
+        serial_puts("[SELFTEST] ALL 16 CHECKS PASSED\n")
     } else {
         serial_puts("[SELFTEST] FAILED: ")
-        serial_put_dec(15 - passed)
+        serial_put_dec(16 - passed)
         serial_puts(" checks failed\n")
     }
     gui_force_redraw()
@@ -527,6 +535,14 @@ fn cmd_uitest_h(coop_ok bool) {
     }
 }
 
+fn cmd_subtest_h(coop_ok bool) {
+    if substrate_self_test() {
+        serial_puts("[SUBSTRATE] PASS\n")
+    } else {
+        serial_puts("[SUBSTRATE] FAIL\n")
+    }
+}
+
 fn cmd_poweroff_h(coop_ok bool) {
     serial_puts("[KERNEL] Powering off QEMU...\n")
     unsafe {
@@ -555,11 +571,12 @@ static shell_cmds [NUM_SHELL_CMDS]ShellCmd = [
     ShellCmd{name: "linuxtest", desc: "Run unmodified Linux x86_64 ELF64 guest app",       handler: (cmd_linuxtest_h) as *raw u8},
     ShellCmd{name: "mactest",   desc: "Run unmodified macOS x86_64 Mach-O guest app",      handler: (cmd_mactest_h) as *raw u8},
     ShellCmd{name: "uitest",    desc: "Run #ui/widgets Ring 3 smoke test (Linux+macOS)",   handler: (cmd_uitest_h) as *raw u8},
+    ShellCmd{name: "subtest",   desc: "Run OS substrate test (@weak/@naked/SMP/LAPIC)",    handler: (cmd_subtest_h) as *raw u8},
     ShellCmd{name: "ui",        desc: "Launch #ui/widgets Ring 3 desktop (Linux ELF64)",   handler: (cmd_ui_h) as *raw u8},
     ShellCmd{name: "uimac",     desc: "Launch #ui/widgets Ring 3 desktop (macOS Mach-O)",  handler: (cmd_uimac_h) as *raw u8},
     ShellCmd{name: "clear",     desc: "Clear GUI terminal screen",                         handler: (cmd_clear_h) as *raw u8},
     ShellCmd{name: "spawn",     desc: "Spawn dynamic kernel worker task",                  handler: (cmd_spawn_h) as *raw u8},
-    ShellCmd{name: "selftest",  desc: "Run full 15-part OS verification suite",            handler: (cmd_selftest_h) as *raw u8},
+    ShellCmd{name: "selftest",  desc: "Run full 16-part OS verification suite",            handler: (cmd_selftest_h) as *raw u8},
     ShellCmd{name: "poweroff",  desc: "Cleanly shut down QEMU",                            handler: (cmd_poweroff_h) as *raw u8}
 ]
 

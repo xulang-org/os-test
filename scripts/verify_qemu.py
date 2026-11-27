@@ -159,7 +159,8 @@ def main() -> int:
         must_contain(out_help, "uitest", "help")
 
         out_self = sess.send_cmd("selftest")
-        must_contain(out_self, "[SELFTEST] ALL 15 CHECKS PASSED", "selftest")
+        must_contain(out_self, "[PASS] 16/16", "selftest")
+        must_contain(out_self, "[SELFTEST] ALL 16 CHECKS PASSED", "selftest")
 
         out_info = sess.send_cmd("info")
         must_contain(out_info, "CPU Vendor     :", "info")
@@ -235,6 +236,10 @@ def main() -> int:
         must_contain(out_ui, "[UI-DESKTOP] ABI=macos", "uitest")
         must_contain(out_ui, "[UI-WIDGETS] Ring3 #ui/widgets Desktop (Linux ELF64 + macOS Mach-O) OK", "uitest")
         must_contain(out_ui, "[UI] PASS", "uitest")
+
+        out_sub = sess.send_cmd("subtest")
+        must_contain(out_sub, "[SUBSTRATE] extern_static+@weak+@naked+atomics+fxsave+gs+lapic_ver=", "subtest")
+        must_contain(out_sub, "[SUBSTRATE] PASS", "subtest")
 
         out_spawn = sess.send_cmd("spawn")
         must_contain(out_spawn, "[SCHED] Spawned dyn_worker tid=", "spawn")

@@ -8,12 +8,20 @@ CROSS_OBJCOPY ?= x86_64-elf-objcopy
 QEMU ?= qemu-system-x86_64
 PYTHON ?= python3
 
-XU_SRCS := main.xu serial.xu idt.xu pmm.xu vmm.xu heap.xu sched.xu user.xu blk.xu fs.xu font.xu fb.xu input.xu gui.xu shell.xu kmeta/mod.xu
+XU_SRCS := main.xu serial.xu idt.xu pmm.xu vmm.xu heap.xu sched.xu user.xu blk.xu fs.xu font.xu fb.xu input.xu gui.xu shell.xu substrate.xu kmeta/mod.xu
 DESKTOP_SRCS := userprog/desktop/main.xu userprog/desktop/xdf_sw.xu userprog/desktop/xu.xun
 
-.PHONY: all qemu gui verify clean check
+.PHONY: all qemu gui verify clean check debug
 
 all: build/os.elf build/disk.img
+
+debug: build/os64_dbg.elf
+
+build/kernel_xu_dbg.o: $(XU_SRCS) xu.xun | build
+	$(XU) build --profile=freestanding --target=x64-none -g --emit-obj . -o build/kernel_xu_dbg.o
+
+build/os64_dbg.elf: build/boot.o build/kernel_xu_dbg.o arch/x86_64/linker.ld
+	$(CROSS_LD) -T arch/x86_64/linker.ld -z max-page-size=0x1000 -nostdlib build/boot.o build/kernel_xu_dbg.o -o build/os64_dbg.elf
 
 build:
 	mkdir -p build

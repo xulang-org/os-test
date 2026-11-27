@@ -130,7 +130,9 @@ pub fn vmm_create_user_pml4() u64 {
         k_pdpt := (*kp) & u64(VMM_ADDR_MASK)
         k_pd0 := (*(k_pdpt as *raw u64)) & u64(VMM_ADDR_MASK)
 
-        mem.memcpy(user_pdpt as *raw u8, k_pdpt as *raw u8, 4096)
+        // Copy only shared low-4GiB kernel entries (PDPT[0..3]: identity RAM + MMIO);
+        // keep PDPT[4..511] private so vmm_destroy_user_pml4 never frees kernel tables (e.g. PDPT[256]).
+        mem.memcpy(user_pdpt as *raw u8, k_pdpt as *raw u8, 32)
         mem.memcpy(user_pd0 as *raw u8, k_pd0 as *raw u8, 4096)
 
         // Carve out [0x400000, 0x1000000) (12 MiB) in user_pd0[2..7] for Linux ELF64 userland
