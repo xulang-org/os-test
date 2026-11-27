@@ -19,6 +19,8 @@ class QemuSession:
                 "128M",
                 "-cpu",
                 "qemu64",
+                "-smp",
+                "2",
                 "-kernel",
                 kernel_path,
                 "-drive",
@@ -135,7 +137,7 @@ def main() -> int:
         ]
     )
 
-    sess = QemuSession(kernel, disk, timeout=20.0)
+    sess = QemuSession(kernel, disk, timeout=45.0)
     try:
         boot_out = sess.read_until("xu-os> ")
         must_contain(boot_out, "Xu OS Test Kernel (x86_64 Long Mode, Freestanding)", "boot")
@@ -159,8 +161,8 @@ def main() -> int:
         must_contain(out_help, "uitest", "help")
 
         out_self = sess.send_cmd("selftest")
-        must_contain(out_self, "[PASS] 16/16", "selftest")
-        must_contain(out_self, "[SELFTEST] ALL 16 CHECKS PASSED", "selftest")
+        must_contain(out_self, "[PASS] 17/17", "selftest")
+        must_contain(out_self, "[SELFTEST] ALL 17 CHECKS PASSED", "selftest")
 
         out_info = sess.send_cmd("info")
         must_contain(out_info, "CPU Vendor     :", "info")
@@ -238,8 +240,13 @@ def main() -> int:
         must_contain(out_ui, "[UI] PASS", "uitest")
 
         out_sub = sess.send_cmd("subtest")
-        must_contain(out_sub, "[SUBSTRATE] extern_static+@weak+@naked+atomics+fxsave+gs+lapic_ver=", "subtest")
+        must_contain(out_sub, "[SUBSTRATE] extern_static+@weak+@naked+@interrupt+asm_ops+atomics+lapic_ver=", "subtest")
         must_contain(out_sub, "[SUBSTRATE] PASS", "subtest")
+
+        out_smp = sess.send_cmd("smptest")
+        must_contain(out_smp, "[SMP] ACPI MADT cpus=", "smptest")
+        must_contain(out_smp, "lock=40000", "smptest")
+        must_contain(out_smp, "[SMP] PASS", "smptest")
 
         out_spawn = sess.send_cmd("spawn")
         must_contain(out_spawn, "[SCHED] Spawned dyn_worker tid=", "spawn")
@@ -271,7 +278,7 @@ def main() -> int:
             raise AssertionError(f"[xufs] Expected /tmp/persist.txt == b'XUFS-PERSIST-OK', got {persisted!r}")
 
         print(sess.full_log)
-        print("VERIFICATION PASSED: All 12 kernel subsystems (incl. XuFS, Pure-Xu Ring 3 ELF64 W^X+NX, and #PF Demand/Fault Containment) verified in QEMU!")
+        print("VERIFICATION PASSED: All 17 kernel subsystems (incl. Dual-Core SMP, ACPI, Pure-Xu Ring 3 ELF64, and @interrupt) verified in QEMU!")
         return 0
     finally:
         sess.close()

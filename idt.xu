@@ -208,3 +208,20 @@ pub fn idt_enable_irqs() {
     arch.pic_unmask(u8(4))
     arch.pic_unmask(u8(12))
 }
+
+pub fn idt_set_gate_pub(vec int, handler u64, attr u8) {
+    if vec < 0 || vec >= 256 {
+        <<
+    }
+    unsafe {
+        $gate := idt_table[vec]
+        gate.set_gate(handler, u16(0x08), attr)
+        idt_table[vec] = gate
+    }
+}
+
+pub fn idt_pointer_addr() u64 {
+    unsafe {
+        << (($&idtr) as *raw arch.IdtPointer) as u64
+    }
+}

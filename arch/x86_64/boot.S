@@ -441,6 +441,95 @@ vmmouse_cmd_asm:
     popq %rbx
     ret
 
+/* ===== Relocatable 16->32->64-bit AP Startup Trampoline (copied to 0x8000) ===== */
+.code16
+.globl ap_trampoline_start
+.globl ap_trampoline_end
+.align 16
+ap_trampoline_start:
+    cli
+    cld
+    xorw %ax, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+
+    lgdt (0x8000 + (ap_gdt_ptr - ap_trampoline_start))
+    movl %cr0, %eax
+    orl  $1, %eax
+    movl %eax, %cr0
+    ljmpl $0x18, $(0x8000 + (ap_pm32 - ap_trampoline_start))
+
+.code32
+ap_pm32:
+    movw $0x20, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw %ax, %fs
+    movw %ax, %gs
+
+    movl 0x8F00, %eax
+    movl %eax, %cr3
+
+    movl %cr4, %eax
+    orl  $(1 << 5), %eax
+    movl %eax, %cr4
+
+    movl $0xC0000080, %ecx
+    rdmsr
+    orl  $0x900, %eax              /* LME | NXE */
+    wrmsr
+
+    movl %cr0, %eax
+    orl  $0x80000001, %eax         /* PG | PE */
+    movl %eax, %cr0
+    ljmpl $0x08, $(0x8000 + (ap_lm64 - ap_trampoline_start))
+
+.code64
+ap_lm64:
+    movw $0x10, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %ss
+    movw %ax, %fs
+    movw %ax, %gs
+
+    movq %cr0, %rax
+    andq $~(1 << 2), %rax
+    orq  $(1 << 1), %rax
+    movq %rax, %cr0
+
+    movq %cr4, %rax
+    orq  $((1 << 9) | (1 << 10)), %rax
+    movq %rax, %cr4
+
+    movq 0x8F18, %rax
+    lidt (%rax)
+
+    movq 0x8F08, %rsp
+    andq $-16, %rsp
+    movq 0x8F10, %rax
+    call *%rax
+1:
+    cli
+    hlt
+    jmp 1b
+
+.align 8
+ap_gdt:
+    .quad 0x0000000000000000       /* 0x00: null */
+    .quad 0x00AF9A000000FFFF       /* 0x08: 64-bit Kernel Code (matches BSP GDT/IDT) */
+    .quad 0x00AF92000000FFFF       /* 0x10: 64-bit Kernel Data (matches BSP GDT) */
+    .quad 0x00CF9A000000FFFF       /* 0x18: 32-bit Temp Code */
+    .quad 0x00CF92000000FFFF       /* 0x20: 32-bit Temp Data */
+ap_gdt_end:
+ap_gdt_ptr:
+    .word ap_gdt_end - ap_gdt - 1
+    .long (0x8000 + (ap_gdt - ap_trampoline_start))
+ap_trampoline_end:
+.code64
+
 .section .rodata.boot, "a"
 .align 16
 .globl user_demo_code_start

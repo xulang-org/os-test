@@ -1,0 +1,233 @@
+@main
+$freestanding
+
+#core/acpi
+#core/arch
+#core/mem
+#core/sync
+
+extern "C" {
+    let ap_trampoline_start u8
+    let ap_trampoline_end u8
+}
+
+@align(16)
+static $ap_stack [16384]u8
+
+static $g_smp_lapic_base u64
+static $g_smp_lock sync.TicketLock
+static $g_smp_shared u64
+static $g_smp_ap_online sync.AtomicU64
+static $g_smp_ap_id sync.AtomicU64
+static $g_smp_cmd sync.AtomicU64
+static $g_smp_ack sync.AtomicU64
+static $g_smp_ipi_count sync.AtomicU64
+
+@interrupt
+pub fn smp_ipi82_isr() {
+    unsafe {
+        g_smp_ipi_count.fetch_add(u64(1))
+        if g_smp_lapic_base != u64(0) {
+            arch.lapic_eoi(g_smp_lapic_base)
+        }
+    }
+}
+
+@export("smp_ap_main")
+pub fn smp_ap_main() {
+    unsafe {
+        lapic := g_smp_lapic_base
+        if lapic != u64(0) {
+            arch.lapic_enable(lapic, u8(0xFF))
+            g_smp_ap_id.store(u64(arch.lapic_id(lapic)))
+        }
+        g_smp_ap_online.store(u64(1))
+        arch.sti()
+
+        while true {
+            cmd := g_smp_cmd.load()
+            if cmd == u64(1) {
+                $k := 0
+                while k < 20000 {
+                    if true {
+                        _g := g_smp_lock.acquire()
+                        g_smp_shared += u64(1)
+                    }
+                    k += 1
+                }
+                g_smp_cmd.store(u64(0))
+                g_smp_ack.fetch_add(u64(1))
+            } else {
+                arch.pause()
+            }
+        }
+    }
+}
+
+fn smp_delay(iters int) {
+    $i := 0
+    unsafe {
+        while i < iters {
+            arch.pause()
+            i += 1
+        }
+    }
+}
+
+pub fn smp_self_test() bool {
+    rsdp := acpi.find_rsdp()
+    if rsdp == u64(0) {
+        serial_puts("[SMP] FAIL: ACPI RSDP not found\n")
+        << false
+    }
+    madt_addr := acpi.find_table(rsdp, u8(65), u8(80), u8(73), u8(67)) // "APIC"
+    if madt_addr == u64(0) {
+        serial_puts("[SMP] FAIL: ACPI MADT not found\n")
+        << false
+    }
+    $madt := acpi.MadtInfo{
+        lapic_addr: u64(0),
+        ioapic_addr: u64(0),
+        ioapic_id: u8(0),
+        ioapic_gsi_base: u32(0),
+        lapic_count: 0,
+        lapic_ids: [32]u8{},
+        iso_count: 0,
+        isos: [16]acpi.MadtIso{}
+    }
+    $madt_ok := false
+    unsafe {
+        madt_ok = acpi.parse_madt(madt_addr, ($&madt) as *raw acpi.MadtInfo)
+    }
+    if !madt_ok {
+        serial_puts("[SMP] FAIL: parse_madt failed\n")
+        << false
+    }
+    if madt.lapic_count < 2 || madt.ioapic_addr == u64(0) || madt.lapic_addr == u64(0) {
+        serial_puts("[SMP] FAIL: MADT reports <2 CPUs or missing IOAPIC\n")
+        << false
+    }
+
+    mmio_flags := u64(VMM_PAGE_WRITABLE | VMM_PAGE_PCD | VMM_PAGE_PWT) | vmm_nx_bit()
+    if !vmm_map_page(vmm_kernel_pml4(), madt.lapic_addr, madt.lapic_addr, mmio_flags) {
+        serial_puts("[SMP] FAIL: map LAPIC\n")
+        << false
+    }
+    if !vmm_map_page(vmm_kernel_pml4(), madt.ioapic_addr, madt.ioapic_addr, mmio_flags) {
+        serial_puts("[SMP] FAIL: map IOAPIC\n")
+        << false
+    }
+
+    ioapic_ver := arch.ioapic_version(madt.ioapic_addr)
+    ioapic_max := arch.ioapic_max_redir(madt.ioapic_addr)
+    if ioapic_ver == u32(0) {
+        serial_puts("[SMP] FAIL: invalid IOAPIC version\n")
+        << false
+    }
+
+    arch.lapic_enable(madt.lapic_addr, u8(0xFF))
+    bsp_id := u8(arch.lapic_id(madt.lapic_addr))
+
+    $ap_id := u8(0)
+    $found_ap := false
+    for ci in 0:madt.lapic_count {
+        if madt.lapic_ids[ci] != bsp_id {
+            ap_id = madt.lapic_ids[ci]
+            found_ap = true
+            <-
+        }
+    }
+    if !found_ap {
+        serial_puts("[SMP] FAIL: no secondary APIC ID found\n")
+        << false
+    }
+
+    unsafe {
+        g_smp_lapic_base = madt.lapic_addr
+        idt_set_gate_pub(0x82, (smp_ipi82_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
+
+        if g_smp_ap_online.load() == u64(0) {
+            t_start := ((&ap_trampoline_start) as *raw u8) as u64
+            t_end := ((&ap_trampoline_end) as *raw u8) as u64
+            t_len := int(t_end - t_start)
+            mem.memcpy(u64(0x8000) as *raw u8, t_start as *raw u8, t_len)
+
+            stack_top := ((($&ap_stack[0]) as *raw u8) as u64) + u64(16384)
+            entry_addr := (smp_ap_main as *raw u8) as u64
+            idtr_ptr := idt_pointer_addr()
+
+            *(u64(0x8F00) as *raw u64) = vmm_kernel_pml4()
+            *(u64(0x8F08) as *raw u64) = stack_top
+            *(u64(0x8F10) as *raw u64) = entry_addr
+            *(u64(0x8F18) as *raw u64) = idtr_ptr
+
+            arch.lapic_send_init(madt.lapic_addr, ap_id)
+            smp_delay(200000)
+            arch.lapic_send_sipi(madt.lapic_addr, ap_id, u8(0x08))
+            smp_delay(100000)
+            if g_smp_ap_online.load() == u64(0) {
+                arch.lapic_send_sipi(madt.lapic_addr, ap_id, u8(0x08))
+            }
+
+            $tries := 0
+            while g_smp_ap_online.load() == u64(0) && tries < 20000000 {
+                arch.pause()
+                tries += 1
+            }
+            if g_smp_ap_online.load() == u64(0) {
+                serial_puts("[SMP] FAIL: AP did not come online\n")
+                << false
+            }
+        }
+
+        // Dual-core TicketLock contention stress: 20,000 increments on BSP + 20,000 on AP.
+        g_smp_shared = u64(0)
+        prev_ack := g_smp_ack.load()
+        g_smp_cmd.store(u64(1))
+        $bk := 0
+        while bk < 20000 {
+            if true {
+                _g := g_smp_lock.acquire()
+                g_smp_shared += u64(1)
+            }
+            bk += 1
+        }
+        $wait_ack := 0
+        while g_smp_ack.load() <= prev_ack && wait_ack < 20000000 {
+            arch.pause()
+            wait_ack += 1
+        }
+        if g_smp_shared != u64(40000) {
+            serial_puts("[SMP] FAIL: TicketLock shared_counter=")
+            serial_put_dec(int(g_smp_shared))
+            serial_puts(" (expected 40000)\n")
+            << false
+        }
+
+        // Cross-core LAPIC Fixed IPI to AP at IDT vector 0x82 (@interrupt)
+        prev_ipi := g_smp_ipi_count.load()
+        arch.lapic_send_ipi(madt.lapic_addr, ap_id, u8(0x82))
+        $wait_ipi := 0
+        while g_smp_ipi_count.load() <= prev_ipi && wait_ipi < 10000000 {
+            arch.pause()
+            wait_ipi += 1
+        }
+        if g_smp_ipi_count.load() <= prev_ipi {
+            serial_puts("[SMP] FAIL: LAPIC IPI to AP timed out\n")
+            << false
+        }
+
+        serial_puts("[SMP] ACPI MADT cpus=")
+        serial_put_dec(madt.lapic_count)
+        serial_puts(" ioapic_ver=")
+        serial_put_dec(int(ioapic_ver))
+        serial_puts(" max_redir=")
+        serial_put_dec(int(ioapic_max))
+        serial_puts(" ap_id=")
+        serial_put_dec(int(g_smp_ap_id.load()))
+        serial_puts(" lock=40000 ipi=")
+        serial_put_dec(int(g_smp_ipi_count.load()))
+        serial_puts(" OK\n")
+    }
+    << true
+}
