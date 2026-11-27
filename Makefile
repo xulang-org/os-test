@@ -77,10 +77,10 @@ check:
 	$(XU) check userprog/desktop
 
 qemu: build/os.elf build/disk.img
-	$(QEMU) -m 128M -cpu qemu64 -smp 2 -kernel build/os.elf -drive file=build/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0,disable-modern=on -serial stdio -display none -no-reboot
+	$(QEMU) -m 128M -cpu qemu64 -smp 2 -kernel build/os.elf -drive file=build/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0 -serial stdio -display none -no-reboot
 
 gui: build/os.elf build/disk.img
-	$(QEMU) -M pc,vmport=on -m 128M -cpu qemu64 -smp 2 -vga std -display cocoa -kernel build/os.elf -append ui -drive file=build/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0,disable-modern=on -serial stdio -no-reboot
+	$(QEMU) -M pc,vmport=on -m 128M -cpu qemu64 -smp 2 -vga std -display cocoa -kernel build/os.elf -append ui -drive file=build/disk.img,if=none,format=raw,id=hd0 -device virtio-blk-pci,drive=hd0 -serial stdio -no-reboot
 
 verify: build/os.elf build/disk.img
 	$(PYTHON) scripts/verify_qemu.py

@@ -1,6 +1,6 @@
 # Xu OS Test Kernel (`os-test`)
 
-A freestanding x86_64 Long Mode microkernel written in **Xu (`--profile=freestanding --target=x64-none --no-sse`)**, featuring 19 verified subsystems, real dual-core SMP (`-smp 2`) with cross-core TLB Shootdown and autonomous AP periodic LAPIC timer, Dual-ABI Ring 3 execution (unmodified Linux x86_64 ELF64 + macOS x86_64 Mach-O 64-bit), a `1280×800` `#ui/widgets` Ring 3 graphical desktop, and QEMU `vmmouse` pointer integration.
+A freestanding x86_64 Long Mode microkernel written in **Xu (`--profile=freestanding --target=x64-none --no-sse`)**, featuring 20 verified subsystems, VirtIO 1.0 Modern PCI MMIO block storage, real dual-core SMP (`-smp 2`) with cross-core TLB Shootdown, HPET clock, `FXSAVE`/`FXRSTOR` FPU state, AP Job Queue, and autonomous AP periodic LAPIC timer, Dual-ABI Ring 3 execution (unmodified Linux x86_64 ELF64 + macOS x86_64 Mach-O 64-bit), a `1280×800` `#ui/widgets` Ring 3 graphical desktop, and QEMU `vmmouse` pointer integration.
 
 ## Features & Architecture
 
@@ -18,10 +18,10 @@ A freestanding x86_64 Long Mode microkernel written in **Xu (`--profile=freestan
   - `heap.xu`: First-fit kernel heap (`kmalloc`/`kfree`) with 16-byte aligned payloads and bidirectional block coalescing.
   - `sched.xu`: Preemptive round-robin scheduler (50 ms quantum, sleep/wake queue, dynamic task spawn/exit) + cooperative `#core/task.switch_context`.
   - `user.xu`, `userprog/*.xu`: 64-bit GDT/TSS, `SYSCALL`/`SYSRET` MSRs (`swapgs`), `#core/elf` ELF64 loader + Mach-O 64-bit loader with strict `W^X` + `NX` + per-process `CR3` isolation, Dual-ABI syscall translation (Linux x86_64 ELF64 + macOS x86_64 Mach-O), coalescing Ring 3 `mmap` arena with demand paging, VFD virtual files (`/dev/fb0`, `/dev/vmmouse`, `/etc/font.ttf`, `/proc/xufs`, `/proc/app_out`, `/proc/cmd`), and nested Ring 3 child execution (`user_exec_subapp`).
-  - `blk.xu`, `fs.xu`, `pci.xu`: Real `#core/virtio.VirtioPciBlkDriver`, `#core/pci` recursive bridge enumeration/capability & 64-bit BAR inspection (`lspci`, `pcitest`), and persistent `XuFS` filesystem on VirtIO-Blk (`build/disk.img`).
-  - `substrate.xu`, `smp.xu`: Low-level OS primitives (`@weak`, `@naked`, `@interrupt`, register-operand inline `asm`, atomics) and dual-core SMP bring-up via `#core/acpi` MADT/FADT/HPET, IOAPIC, INIT-SIPI-SIPI AP trampoline (`@noreturn`), per-CPU `MSR_IA32_GS_BASE`, `TicketLock`, LAPIC Fixed IPI (`0x82`), AP autonomous periodic LAPIC Timer (`0x83`), and cross-core TLB Shootdown IPI (`0x84`, `tlbtest`).
+  - `blk.xu`, `fs.xu`, `pci.xu`: Real `#core/virtio.VirtioPciBlkDriver` (VirtIO 1.0 Modern PCI MMIO Capabilities + Legacy I/O fallback), `#core/pci` recursive bridge enumeration/capability & 64-bit BAR inspection (`lspci`, `pcitest`), and persistent `XuFS` filesystem on VirtIO-Blk (`build/disk.img`).
+  - `substrate.xu`, `smp.xu`: Low-level OS primitives (`@weak`, `@naked`, `@interrupt`, register-operand inline `asm`, atomics) and dual-core SMP bring-up via `#core/acpi` MADT/FADT/HPET, IOAPIC, INIT-SIPI-SIPI AP trampoline (`@noreturn`), per-CPU `MSR_IA32_GS_BASE`, `TicketLock` 8-slot AP Job Queue, LAPIC Fixed IPI (`0x82`), AP autonomous periodic LAPIC Timer (`0x83`), cross-core TLB Shootdown IPI (`0x84`, `tlbtest`), HPET clock & `FXSAVE`/`FXRSTOR` (`hpettest`).
   - `fb.xu`, `font.xu`, `input.xu`, `gui.xu`: `1280×800×32` diff-only double-buffered framebuffer with cursor overlay, QEMU `vmmouse` 1:1 absolute pointer, lossless PS/2 draining, and interactive `1280×800` kernel shell desktop.
-  - `shell.xu`: Interactive UART shell (`help`, `info`, `mem`, `ps`, `uptime`, `vmtest`, `heaptest`, `usertest`, `blktest`, `ls`, `cat`, `fstest`, `elftest`, `pftest`, `linuxtest`, `mactest`, `uitest`, `subtest`, `smptest`, `lspci`, `pcitest`, `tlbtest`, `spawn`, `gui`, `ui`, `uimac`, `selftest`, `poweroff`).
+  - `shell.xu`: Interactive UART shell (`help`, `info`, `mem`, `ps`, `uptime`, `vmtest`, `heaptest`, `usertest`, `blktest`, `ls`, `cat`, `fstest`, `elftest`, `pftest`, `linuxtest`, `mactest`, `uitest`, `subtest`, `smptest`, `lspci`, `pcitest`, `tlbtest`, `hpettest`, `spawn`, `gui`, `ui`, `uimac`, `selftest`, `poweroff`).
 
 - **Ring 3 `#ui/widgets` Graphical Desktop (`userprog/desktop/`)**:
   - Compiled as both unmodified Linux ELF64 (`/bin/desktop_linux`) and macOS Mach-O (`/bin/desktop_macos`) targets from the exact same `#ui/widgets` source (`main.xu`, `xdf_sw.xu`).
@@ -43,7 +43,7 @@ make check
 # Build kernel (build/os.elf) + VirtIO disk image (build/disk.img)
 make
 
-# Run automated 19-check dual-core SMP + TLB Shootdown + ACPI FADT/HPET + #core/pci + #ui/widgets QEMU suite
+# Run automated 20-check VirtIO 1.0 Modern MMIO + Dual-Core SMP/HPET/FXSAVE + #core/pci + #ui/widgets QEMU suite
 make verify
 
 # Launch interactive 1280x800 QEMU Cocoa GUI (boots straight into Ring 3 desktop)

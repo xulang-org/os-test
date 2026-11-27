@@ -26,7 +26,7 @@ class QemuSession:
                 "-drive",
                 f"file={disk_path},if=none,format=raw,id=hd0",
                 "-device",
-                "virtio-blk-pci,drive=hd0,disable-modern=on",
+                "virtio-blk-pci,drive=hd0",
                 "-serial",
                 "stdio",
                 "-display",
@@ -146,7 +146,7 @@ def main() -> int:
         must_contain(boot_out, "[BOOT] VMM 4-level paging active, CR3=0x", "boot")
         must_contain(boot_out, "[BOOT] GDT/TSS (64-bit) & SYSCALL/SYSRET MSRs configured.", "boot")
         must_contain(boot_out, "[BOOT] Framebuffer 1280x800x32 (Bochs VBE) & PS/2 input ready.", "boot")
-        must_contain(boot_out, "[BOOT] VirtIO-Blk PCI driver ready (32768 sectors).", "boot")
+        must_contain(boot_out, "[BOOT] VirtIO-Blk PCI driver ready (32768 sectors) [Modern 1.0 MMIO].", "boot")
         must_contain(boot_out, "[BOOT] XuFS mounted on VirtIO-Blk (8 files).", "boot")
         must_contain(boot_out, "[BOOT] Cooperative #core/task.switch_context test PASSED.", "boot")
         must_contain(boot_out, "[BOOT] Enabling interrupts and starting preemptive scheduler...", "boot")
@@ -159,10 +159,11 @@ def main() -> int:
         must_contain(out_help, "linuxtest", "help")
         must_contain(out_help, "mactest", "help")
         must_contain(out_help, "uitest", "help")
+        must_contain(out_help, "hpettest", "help")
 
         out_self = sess.send_cmd("selftest")
-        must_contain(out_self, "[PASS] 19/19", "selftest")
-        must_contain(out_self, "[SELFTEST] ALL 19 CHECKS PASSED", "selftest")
+        must_contain(out_self, "[PASS] 20/20", "selftest")
+        must_contain(out_self, "[SELFTEST] ALL 20 CHECKS PASSED", "selftest")
 
         out_info = sess.send_cmd("info")
         must_contain(out_info, "CPU Vendor     :", "info")
@@ -263,6 +264,11 @@ def main() -> int:
         must_contain(out_tlb, "ap_timer_ticks=", "tlbtest")
         must_contain(out_tlb, "[TLB-ACPI] PASS", "tlbtest")
 
+        out_hpet = sess.send_cmd("hpettest")
+        must_contain(out_hpet, "[SMP-HPET] period_fs=", "hpettest")
+        must_contain(out_hpet, "ap_jobs=8 sum=3600 OK", "hpettest")
+        must_contain(out_hpet, "[HPET-FPU] PASS", "hpettest")
+
         out_spawn = sess.send_cmd("spawn")
         must_contain(out_spawn, "[SCHED] Spawned dyn_worker tid=", "spawn")
 
@@ -293,7 +299,7 @@ def main() -> int:
             raise AssertionError(f"[xufs] Expected /tmp/persist.txt == b'XUFS-PERSIST-OK', got {persisted!r}")
 
         print(sess.full_log)
-        print("VERIFICATION PASSED: All 19 kernel subsystems (incl. Dual-Core TLB Shootdown, AP Timer, ACPI FADT/HPET, #core/pci, and Dual-ABI) verified in QEMU!")
+        print("VERIFICATION PASSED: All 20 kernel subsystems (incl. VirtIO 1.0 Modern MMIO, HPET, FXSAVE, AP Job Queue, Dual-Core TLB Shootdown, and Dual-ABI) verified in QEMU!")
         return 0
     finally:
         sess.close()

@@ -109,7 +109,11 @@ fn main() int {
     if blk_init() {
         serial_puts("[BOOT] VirtIO-Blk PCI driver ready (")
         serial_put_dec(int(blk_capacity_sectors()))
-        serial_puts(" sectors).\n")
+        serial_puts(" sectors)")
+        if blk_is_modern() {
+            serial_puts(" [Modern 1.0 MMIO]")
+        }
+        serial_puts(".\n")
         if fs_mount() {
             serial_puts("[BOOT] XuFS mounted on VirtIO-Blk (")
             serial_put_dec(fs_file_count())
