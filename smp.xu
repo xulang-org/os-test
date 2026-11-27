@@ -14,6 +14,15 @@ extern "C" {
 @align(16)
 static $ap_stack [16384]u8
 
+@repr("C")
+pub struct PerCpu {
+    pub cpu_id u64
+    pub apic_id u64
+    pub ipi_hits u64
+    pub timer_hits u64
+}
+
+static $g_percpu [2]PerCpu
 static $g_smp_lapic_base u64
 static $g_smp_lock sync.TicketLock
 static $g_smp_shared u64
@@ -22,10 +31,14 @@ static $g_smp_ap_id sync.AtomicU64
 static $g_smp_cmd sync.AtomicU64
 static $g_smp_ack sync.AtomicU64
 static $g_smp_ipi_count sync.AtomicU64
+static $g_smp_ipi_cpu sync.AtomicU64
+static $g_smp_timer_count sync.AtomicU64
 
 @interrupt
 pub fn smp_ipi82_isr() {
     unsafe {
+        cid := arch.gs_read_u64(u64(0))
+        g_smp_ipi_cpu.store(cid)
         g_smp_ipi_count.fetch_add(u64(1))
         if g_smp_lapic_base != u64(0) {
             arch.lapic_eoi(g_smp_lapic_base)
@@ -33,14 +46,34 @@ pub fn smp_ipi82_isr() {
     }
 }
 
+@interrupt
+pub fn smp_lapic_timer_isr() {
+    unsafe {
+        g_smp_timer_count.fetch_add(u64(1))
+        if g_smp_lapic_base != u64(0) {
+            arch.lapic_eoi(g_smp_lapic_base)
+        }
+    }
+}
+
+@noreturn
 @export("smp_ap_main")
 pub fn smp_ap_main() {
     unsafe {
         lapic := g_smp_lapic_base
+        $aid := u64(0)
         if lapic != u64(0) {
             arch.lapic_enable(lapic, u8(0xFF))
-            g_smp_ap_id.store(u64(arch.lapic_id(lapic)))
+            aid = u64(arch.lapic_id(lapic))
+            g_smp_ap_id.store(aid)
         }
+        g_percpu[1] = PerCpu{
+            cpu_id: u64(1),
+            apic_id: aid,
+            ipi_hits: u64(0),
+            timer_hits: u64(0)
+        }
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), (($&g_percpu[1]) as *raw PerCpu) as u64)
         g_smp_ap_online.store(u64(1))
         arch.sti()
 
@@ -143,8 +176,23 @@ pub fn smp_self_test() bool {
     }
 
     unsafe {
+        orig_gs := arch.rdmsr(u32(arch.MSR_IA32_GS_BASE))
+        g_percpu[0] = PerCpu{
+            cpu_id: u64(0),
+            apic_id: u64(bsp_id),
+            ipi_hits: u64(0),
+            timer_hits: u64(0)
+        }
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), (($&g_percpu[0]) as *raw PerCpu) as u64)
+        if arch.gs_read_u64(u64(0)) != u64(0) || arch.gs_read_u64(u64(8)) != u64(bsp_id) {
+            arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
+            serial_puts("[SMP] FAIL: BSP PerCpu GS base mismatch\n")
+            << false
+        }
+
         g_smp_lapic_base = madt.lapic_addr
         idt_set_gate_pub(0x82, (smp_ipi82_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
+        idt_set_gate_pub(0x83, (smp_lapic_timer_isr as *raw u8) as u64, u8(arch.IDT_ATTR_INT32))
 
         if g_smp_ap_online.load() == u64(0) {
             t_start := ((&ap_trampoline_start) as *raw u8) as u64
@@ -175,6 +223,7 @@ pub fn smp_self_test() bool {
                 tries += 1
             }
             if g_smp_ap_online.load() == u64(0) {
+                arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
                 serial_puts("[SMP] FAIL: AP did not come online\n")
                 << false
             }
@@ -198,13 +247,15 @@ pub fn smp_self_test() bool {
             wait_ack += 1
         }
         if g_smp_shared != u64(40000) {
+            arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
             serial_puts("[SMP] FAIL: TicketLock shared_counter=")
             serial_put_dec(int(g_smp_shared))
             serial_puts(" (expected 40000)\n")
             << false
         }
 
-        // Cross-core LAPIC Fixed IPI to AP at IDT vector 0x82 (@interrupt)
+        // Cross-core LAPIC Fixed IPI to AP at IDT vector 0x82 (@interrupt + AP PerCpu GS)
+        g_smp_ipi_cpu.store(u64(999))
         prev_ipi := g_smp_ipi_count.load()
         arch.lapic_send_ipi(madt.lapic_addr, ap_id, u8(0x82))
         $wait_ipi := 0
@@ -213,9 +264,34 @@ pub fn smp_self_test() bool {
             wait_ipi += 1
         }
         if g_smp_ipi_count.load() <= prev_ipi {
+            arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
             serial_puts("[SMP] FAIL: LAPIC IPI to AP timed out\n")
             << false
         }
+        ipi_cid := g_smp_ipi_cpu.load()
+        if ipi_cid != u64(1) {
+            arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
+            serial_puts("[SMP] FAIL: AP PerCpu GS cpu_id=")
+            serial_put_dec(int(ipi_cid))
+            serial_puts(" (expected 1)\n")
+            << false
+        }
+
+        // Hardware LAPIC one-shot Timer IRQ at vector 0x83
+        prev_tmr := g_smp_timer_count.load()
+        arch.lapic_timer_init(madt.lapic_addr, u8(0x83), u32(0x3), u32(50000), false)
+        $wait_tmr := 0
+        while g_smp_timer_count.load() <= prev_tmr && wait_tmr < 20000000 {
+            arch.pause()
+            wait_tmr += 1
+        }
+        if g_smp_timer_count.load() <= prev_tmr {
+            arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
+            serial_puts("[SMP] FAIL: LAPIC timer IRQ 0x83 timed out\n")
+            << false
+        }
+
+        arch.wrmsr(u32(arch.MSR_IA32_GS_BASE), orig_gs)
 
         serial_puts("[SMP] ACPI MADT cpus=")
         serial_put_dec(madt.lapic_count)
@@ -227,6 +303,10 @@ pub fn smp_self_test() bool {
         serial_put_dec(int(g_smp_ap_id.load()))
         serial_puts(" lock=40000 ipi=")
         serial_put_dec(int(g_smp_ipi_count.load()))
+        serial_puts(" ipi_cpu=")
+        serial_put_dec(int(ipi_cid))
+        serial_puts(" lapic_timer=")
+        serial_put_dec(int(g_smp_timer_count.load()))
         serial_puts(" OK\n")
     }
     << true

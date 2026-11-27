@@ -161,8 +161,8 @@ def main() -> int:
         must_contain(out_help, "uitest", "help")
 
         out_self = sess.send_cmd("selftest")
-        must_contain(out_self, "[PASS] 17/17", "selftest")
-        must_contain(out_self, "[SELFTEST] ALL 17 CHECKS PASSED", "selftest")
+        must_contain(out_self, "[PASS] 18/18", "selftest")
+        must_contain(out_self, "[SELFTEST] ALL 18 CHECKS PASSED", "selftest")
 
         out_info = sess.send_cmd("info")
         must_contain(out_info, "CPU Vendor     :", "info")
@@ -246,7 +246,17 @@ def main() -> int:
         out_smp = sess.send_cmd("smptest")
         must_contain(out_smp, "[SMP] ACPI MADT cpus=", "smptest")
         must_contain(out_smp, "lock=40000", "smptest")
+        must_contain(out_smp, "ipi_cpu=1", "smptest")
+        must_contain(out_smp, "lapic_timer=", "smptest")
         must_contain(out_smp, "[SMP] PASS", "smptest")
+
+        out_lspci = sess.send_cmd("lspci")
+        must_contain(out_lspci, "[PCI] Bus 0 devices", "lspci")
+        must_contain(out_lspci, "vendor=0x1af4 device=0x1001", "lspci")
+
+        out_pci = sess.send_cmd("pcitest")
+        must_contain(out_pci, "virtio_blk=0x1af4:0x1001", "pcitest")
+        must_contain(out_pci, "[PCI] PASS", "pcitest")
 
         out_spawn = sess.send_cmd("spawn")
         must_contain(out_spawn, "[SCHED] Spawned dyn_worker tid=", "spawn")
@@ -278,7 +288,7 @@ def main() -> int:
             raise AssertionError(f"[xufs] Expected /tmp/persist.txt == b'XUFS-PERSIST-OK', got {persisted!r}")
 
         print(sess.full_log)
-        print("VERIFICATION PASSED: All 17 kernel subsystems (incl. Dual-Core SMP, ACPI, Pure-Xu Ring 3 ELF64, and @interrupt) verified in QEMU!")
+        print("VERIFICATION PASSED: All 18 kernel subsystems (incl. Dual-Core SMP, #core/pci, LAPIC Timer/IPI, Pure-Xu Ring 3 ELF64, and @interrupt) verified in QEMU!")
         return 0
     finally:
         sess.close()

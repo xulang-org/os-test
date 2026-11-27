@@ -8,7 +8,7 @@ CROSS_OBJCOPY ?= x86_64-elf-objcopy
 QEMU ?= qemu-system-x86_64
 PYTHON ?= python3
 
-XU_SRCS := main.xu serial.xu idt.xu pmm.xu vmm.xu heap.xu sched.xu user.xu blk.xu fs.xu font.xu fb.xu input.xu gui.xu shell.xu substrate.xu smp.xu kmeta/mod.xu
+XU_SRCS := main.xu serial.xu idt.xu pmm.xu vmm.xu heap.xu sched.xu user.xu blk.xu fs.xu font.xu fb.xu input.xu gui.xu shell.xu substrate.xu smp.xu pci.xu kmeta/mod.xu
 DESKTOP_SRCS := userprog/desktop/main.xu userprog/desktop/xdf_sw.xu userprog/desktop/xu.xun
 
 .PHONY: all qemu gui verify clean check debug

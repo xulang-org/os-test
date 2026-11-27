@@ -1,0 +1,91 @@
+@main
+$freestanding
+
+#core/pci
+
+fn pci_put_hex2(v u8) {
+    hi := int((v >> u8(4)) & u8(0xF))
+    lo := int(v & u8(0xF))
+    $hc := 48 + hi
+    if hi >= 10 { hc = 87 + hi }
+    $lc := 48 + lo
+    if lo >= 10 { lc = 87 + lo }
+    serial_putc(u8(hc))
+    serial_putc(u8(lc))
+}
+
+fn pci_put_hex4(v u16) {
+    pci_put_hex2(u8((v >> u16(8)) & u16(0xFF)))
+    pci_put_hex2(u8(v & u16(0xFF)))
+}
+
+fn pci_empty_dev() pci.PciDevice {
+    << pci.PciDevice{
+        bus: u8(0), dev: u8(0), func: u8(0), header_type: u8(0),
+        vendor_id: u16(0), device_id: u16(0), class_code: u8(0),
+        subclass: u8(0), prog_if: u8(0), irq_line: u8(0), bar0: u32(0), bar1: u32(0)
+    }
+}
+
+pub fn pci_list_devices() {
+    $devs := [32]pci.PciDevice{}
+    $count := 0
+    unsafe {
+        count = pci.pci_scan_bus(u8(0), ($&devs[0]) as *raw pci.PciDevice, 32)
+    }
+    serial_puts("[PCI] Bus 0 devices (")
+    serial_put_dec(count)
+    serial_puts("):\n")
+    $limit := count
+    if limit > 32 { limit = 32 }
+    for i in 0:limit {
+        d := devs[i]
+        serial_puts("  ")
+        pci_put_hex2(d.bus)
+        serial_putc(u8(58))
+        pci_put_hex2(d.dev)
+        serial_putc(u8(46))
+        serial_put_dec(int(d.func))
+        serial_puts(" vendor=0x")
+        pci_put_hex4(d.vendor_id)
+        serial_puts(" device=0x")
+        pci_put_hex4(d.device_id)
+        serial_puts(" class=")
+        serial_puts(pci.pci_class_name(d.class_code, d.subclass))
+        serial_puts(" bar0=")
+        serial_put_hex(pci.pci_bar_addr(d.bar0))
+        serial_puts(" irq=")
+        serial_put_dec(int(d.irq_line))
+        serial_puts("\n")
+    }
+}
+
+pub fn pci_self_test() bool {
+    $devs := [32]pci.PciDevice{}
+    $count := 0
+    $vdev := pci_empty_dev()
+    $found := false
+    unsafe {
+        count = pci.pci_scan_bus(u8(0), ($&devs[0]) as *raw pci.PciDevice, 32)
+        found = pci.pci_find_device(u16(0x1AF4), u16(0x1001), ($&vdev) as *raw pci.PciDevice)
+    }
+    if count < 2 {
+        serial_puts("[PCI] FAIL: expected >=2 devices on PCI bus 0\n")
+        << false
+    }
+    if !found {
+        serial_puts("[PCI] FAIL: VirtIO-Blk (0x1af4:0x1001) not found on PCI bus\n")
+        << false
+    }
+    bar0 := pci.pci_bar_addr(vdev.bar0)
+    if bar0 == u64(0) {
+        serial_puts("[PCI] FAIL: VirtIO-Blk BAR0 is 0\n")
+        << false
+    }
+    serial_puts("[PCI] bus0_devs=")
+    serial_put_dec(count)
+    serial_puts(" virtio_blk=0x1af4:0x1001 bar0=")
+    serial_put_hex(bar0)
+    serial_puts(" OK\n")
+    << true
+}
