@@ -33,7 +33,7 @@ fn main() int {
     }
 
     // 3. Read /etc/motd via virtual VFS (Linux openat vs macOS open + read + close)
-    motd := os.read("/etc/motd") or (err) {
+    motd := os.read("/etc/motd") >>> (err) {
         println("[" + tag + "] FAIL read motd: " + err.msg())
         << 2
     }

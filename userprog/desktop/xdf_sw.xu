@@ -630,7 +630,7 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
     rgba := codec.read_word32(payload, p + 4)
     seg_count := codec.read_word32(payload, p + 8)
     dashes := codec.read_word32(payload, p + 12)
-    width := codec.read_float64(payload, p + 16) or (err) { << }
+    width := codec.read_float64(payload, p + 16) >>> (err) { << }
     is_stroke := (flags & 1) != 0
     evenodd := (flags & 2) != 0
 
@@ -661,8 +661,8 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
             }
             fig_xs = []f64{}
             fig_ys = []f64{}
-            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
-            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) >>> (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) >>> (err) { << })
             cursor += 16
             fig_xs.push(nx)
             fig_ys.push(ny)
@@ -672,8 +672,8 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
             if ny < miny { miny = ny }
             if ny > maxy { maxy = ny }
         } else if verb == 2 && has_cur {
-            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
-            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor) >>> (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) >>> (err) { << })
             cursor += 16
             fig_xs.push(nx)
             fig_ys.push(ny)
@@ -682,10 +682,10 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
             if ny < miny { miny = ny }
             if ny > maxy { maxy = ny }
         } else if verb == 3 && has_cur {
-            cx := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
-            cy := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
-            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) or (err) { << })
-            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) or (err) { << })
+            cx := st.tx + st.sx * (codec.read_float64(payload, cursor) >>> (err) { << })
+            cy := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) >>> (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) >>> (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) >>> (err) { << })
             cursor += 32
             flatten_quad_poly(cur_x, cur_y, cx, cy, nx, ny, 0, $&fig_xs, $&fig_ys)
             cur_x = nx
@@ -695,12 +695,12 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
             if ny < miny { miny = ny }
             if ny > maxy { maxy = ny }
         } else if verb == 4 && has_cur {
-            c1x := st.tx + st.sx * (codec.read_float64(payload, cursor) or (err) { << })
-            c1y := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) or (err) { << })
-            c2x := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) or (err) { << })
-            c2y := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) or (err) { << })
-            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 32) or (err) { << })
-            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 40) or (err) { << })
+            c1x := st.tx + st.sx * (codec.read_float64(payload, cursor) >>> (err) { << })
+            c1y := st.ty + st.sy * (codec.read_float64(payload, cursor + 8) >>> (err) { << })
+            c2x := st.tx + st.sx * (codec.read_float64(payload, cursor + 16) >>> (err) { << })
+            c2y := st.ty + st.sy * (codec.read_float64(payload, cursor + 24) >>> (err) { << })
+            nx := st.tx + st.sx * (codec.read_float64(payload, cursor + 32) >>> (err) { << })
+            ny := st.ty + st.sy * (codec.read_float64(payload, cursor + 40) >>> (err) { << })
             cursor += 48
             flatten_cubic_poly(cur_x, cur_y, c1x, c1y, c2x, c2y, nx, ny, 0, $&fig_xs, $&fig_ys)
             cur_x = nx
@@ -743,11 +743,11 @@ fn render_path_op(base *raw u32, w int, payload &string, p int, st &SwState, cov
 }
 
 fn safe_utf8_cp(text &string, pos int) int {
-    << utf8.decode(text, pos) or (err) { << 63 }
+    << utf8.decode(text, pos) >>> (err) { << 63 }
 }
 
 fn safe_utf8_w(text &string, pos int) int {
-    << utf8.decode_width(text, pos) or (err) { << 1 }
+    << utf8.decode_width(text, pos) >>> (err) { << 1 }
 }
 
 fn draw_text_op_raw(base *raw u32, w int, stack &font.FontStack, atl $&font.GlyphAtlas, x f64, y f64, size f64, rgba int, text &string, st &SwState) {
@@ -758,7 +758,7 @@ fn draw_text_op_raw(base *raw u32, w int, stack &font.FontStack, atl $&font.Glyp
     sb := (rgba >> 8) & 255
 
     scaled_sz := size * st.sy
-    lm := stack.line_metrics(scaled_sz) or (err) { << }
+    lm := stack.line_metrics(scaled_sz) >>> (err) { << }
     $pen_x := st.tx + st.sx * x
     baseline_y := st.ty + st.sy * y + lm.ascent
 
@@ -776,7 +776,7 @@ fn draw_text_op_raw(base *raw u32, w int, stack &font.FontStack, atl $&font.Glyp
             pos += step
             ->
         }
-        entry := atl.get_codepoint(stack, cp, scaled_sz) or (err) {
+        entry := atl.get_codepoint(stack, cp, scaled_sz) >>> (err) {
             pos += step
             ->
         }
@@ -810,7 +810,7 @@ fn draw_text_op_raw(base *raw u32, w int, stack &font.FontStack, atl $&font.Glyp
 }
 
 fn rd_f64(payload &string, off int, fallback f64) f64 {
-    << codec.read_float64(payload, off) or (err) { << fallback }
+    << codec.read_float64(payload, off) >>> (err) { << fallback }
 }
 
 pub fn (r $&SwRaster) render_xdf(payload &string, fstack &font.FontStack, atl $&font.GlyphAtlas) {
